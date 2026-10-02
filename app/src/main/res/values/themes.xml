@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 以主题背景色为窗口底色，避免 Compose 接管前白闪/白屏 -->
+    <style name="Theme.ShixuJi" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/shixuji_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/white</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>
