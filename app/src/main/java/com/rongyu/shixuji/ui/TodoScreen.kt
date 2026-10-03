@@ -30,6 +30,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -155,6 +156,15 @@ fun TodoScreen(
     val dayAcc by dayAccFlow.collectAsState(initial = emptyList())
     val dayOut = dayAcc.filter { it.type == 0 }.sumOf { it.amountCents }
     val dayIn = dayAcc.filter { it.type == 1 }.sumOf { it.amountCents }
+
+    // 当月账目（按展示的月份）→ 底栏显示"本月盈余"
+    val mStart = DateUtils.monthStartMs(shownYear, shownMonth)
+    val mEnd = DateUtils.monthEndMs(shownYear, shownMonth)
+    val monthAccFlow = remember(mStart, mEnd) { vm.accountsBetween(mStart, mEnd) }
+    val monthAcc by monthAccFlow.collectAsState(initial = emptyList())
+    val monthSurplus = monthAcc.sumOf {
+        if (it.type == 0) -it.amountCents else it.amountCents
+    }
 
     // 每天的事项数量：年视图热力图用（一次算好，格子 O(1) 查）
     val evCountOfMonth: Map<Int, Map<Int, Int>> = remember(todos) {
@@ -352,7 +362,7 @@ fun TodoScreen(
             }
         }
         // 日历底部记账摘要：放在玻璃底栏上方
-        AccSummaryBar(dayOut, dayIn, { onOpenAccount() },
+        AccSummaryBar(monthSurplus, { onOpenAccount() },
             Modifier.align(Alignment.BottomCenter).padding(bottom = 74.dp))
         // 悬浮按钮直接用实心圆画，不用 FloatingActionButton（FAB 的阴影会浮出多边形亮边）。
         // 涟漪被全局关掉了，所以这里用按压缩放补上点下去的反馈
@@ -448,9 +458,10 @@ fun TodoScreen(
 
 /** 日历底部记账摘要：一行小字，点击跳转记账页 */
 @Composable
-private fun AccSummaryBar(outCents: Long, inCents: Long, onClick: () -> Unit, mod: Modifier) {
+private fun AccSummaryBar(surplus: Long, onClick: () -> Unit, mod: Modifier) {
+    val dot = if (surplus >= 0) "＋" else "−"
     Text(
-        "本日支出 ${formatCents(outCents)} · 收入 ${formatCents(inCents)}",
+        "本月盈余 $dot${formatCents(if (surplus < 0) -surplus else surplus)}",
         fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = mod.fillMaxWidth().clickable { onClick() }.padding(vertical = 3.dp),
         textAlign = TextAlign.Center
@@ -900,7 +911,8 @@ private fun DayTodoList(
 @Composable
 private fun LoopTodoCard(loop: LoopTodo, onToggle: (Long, Boolean) -> Unit) {
     val shape = RoundedCornerShape(18.dp)
-    Card(modifier = Modifier.fillMaxWidth().glassSurface(shape, dark = isDarkTheme, elevation = 5.dp),
+    Card(modifier = Modifier.fillMaxWidth()
+            .glassSurface(shape, dark = isDarkTheme, elevation = 5.dp, strokeInset = 2.dp),
         colors = CardDefaults.cardColors(containerColor = Color.Transparent),
         shape = shape) {
         Row(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -926,7 +938,8 @@ private fun TodoCard(
     val shape = RoundedCornerShape(18.dp)
     val dark = isDarkTheme
     val cardPress = remember { MutableInteractionSource() }
-    Card(modifier = Modifier.fillMaxWidth().glassSurface(shape, dark = isDarkTheme, elevation = 5.dp)
+    Card(modifier = Modifier.fillMaxWidth()
+            .glassSurface(shape, dark = isDarkTheme, elevation = 5.dp, strokeInset = 2.dp)
             .pressScale(cardPress, pressed = 0.97f),
         colors = CardDefaults.cardColors(containerColor = Color.Transparent),
         shape = shape) {
@@ -974,6 +987,8 @@ private fun TodoEditDialog(
     val key = editing?.id
     var title by remember(key) { mutableStateOf(editing?.title ?: "") }
     var detail by remember(key) { mutableStateOf(editing?.detail ?: "") }
+    // 备注默认收起（用户很少填）：已有备注时自动展开，否则点「＋ 备注」才出现
+    var showDetail by remember(key) { mutableStateOf(!(editing?.detail ?: "").isBlank()) }
     var priority by remember(key) { mutableIntStateOf(editing?.priority ?: PRIORITY_NONE) }
     var dueMs by remember(key) {
         mutableLongStateOf(editing?.dueDate?.takeIf { it != 0L } ?: defaultDueMs)
@@ -990,8 +1005,19 @@ private fun TodoEditDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("项目") },
                     singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = detail, onValueChange = { detail = it }, label = { Text("备注（可选）") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                if (showDetail) {
+                    OutlinedTextField(value = detail, onValueChange = { detail = it },
+                        label = { Text("备注（可选）") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                        trailingIcon = {
+                            Text("收起", fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.clickable { showDetail = false })
+                        })
+                } else {
+                    TextButton(onClick = { showDetail = true }, contentPadding = PaddingValues(0.dp)) {
+                        Text("＋ 备注", fontSize = 13.sp)
+                    }
+                }
                 Text("优先级", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf(

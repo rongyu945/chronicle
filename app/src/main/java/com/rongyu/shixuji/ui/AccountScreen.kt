@@ -29,6 +29,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -496,9 +497,9 @@ private fun HeroCell(label: String, value: String, mod: Modifier) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun AccountRow(acc: Account, tagColor: Color, onLongPress: () -> Unit) {
-    val shape = RoundedCornerShape(16.dp)
+    val shape = RoundedCornerShape(18.dp)
     Row(
-        Modifier.fillMaxWidth().glassSurface(shape, dark = isDarkTheme, elevation = 4.dp)
+        Modifier.fillMaxWidth().glassSurface(shape, dark = isDarkTheme, elevation = 4.dp, strokeInset = 2.dp)
             .combinedClickable(onClick = {}, onLongClick = onLongPress)
             .padding(horizontal = 14.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -598,6 +599,8 @@ private fun AccountEditSheet(
     val key = editing?.id
     var amount by remember(key) { mutableStateOf(editing?.let { centsToYuanString(it.amountCents) } ?: "") }
     var title by remember(key) { mutableStateOf(editing?.title ?: "") }
+    // 备注默认收起；已有备注自动展开
+    var showNote by remember(key) { mutableStateOf(!(editing?.title ?: "").isBlank()) }
     var isIncome by remember(key) { mutableStateOf(editing?.type == 1) }
     var tag by remember(key) { mutableStateOf(editing?.tag ?: "") }
     var dateMs by remember(key) { mutableLongStateOf(defaultDateMs) }
@@ -625,8 +628,19 @@ private fun AccountEditSheet(
                     FilterChip(selected = !isIncome, onClick = { isIncome = false }, label = { Text("支出") })
                     FilterChip(selected = isIncome, onClick = { isIncome = true }, label = { Text("收入") })
                 }
-                OutlinedTextField(value = title, onValueChange = { title = it },
-                    label = { Text("备注") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                if (showNote) {
+                    OutlinedTextField(value = title, onValueChange = { title = it },
+                        label = { Text("备注") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                        trailingIcon = {
+                            Text("收起", fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.clickable { showNote = false })
+                        })
+                } else {
+                    TextButton(onClick = { showNote = true }, contentPadding = PaddingValues(0.dp)) {
+                        Text("＋ 备注", fontSize = 13.sp)
+                    }
+                }
                 if (tags.isNotEmpty()) {
                     Text("标签", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {

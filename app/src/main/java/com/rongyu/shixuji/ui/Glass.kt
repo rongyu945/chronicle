@@ -58,6 +58,22 @@ import com.rongyu.shixuji.theme.isDarkTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.graphics.drawscope.CanvasDrawScope
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.Canvas as GfxCanvas
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.composed
 
 /** 一个"什么都不画"的点击反馈：交给它之后，点任何东西都不会再泛灰 */
 private object NoIndication : IndicationNodeFactory {
@@ -185,23 +201,10 @@ fun glassDialogModifier(): Modifier {
         )
         .drawBehind {
             val r = CornerRadius(30.dp.toPx(), 30.dp.toPx())
-            // ② 玻璃体：左上亮、右下沉
+            // ② 弹窗体：与条目同一套 —— 纯白 / 暖深 + 0.85 透明
+            //    0.85 比 0.88 再"小小拉高"一点透明度（用户 2026-10-03）
             drawRoundRect(
-                brush = Brush.linearGradient(
-                    colors = if (dark) listOf(Color.White.copy(alpha = 0.25f), Color.White.copy(alpha = 0.10f))
-                    else listOf(Color.White.copy(alpha = 0.64f), Color.White.copy(alpha = 0.42f)),
-                    start = Offset(0f, 0f),
-                    end = Offset(size.width * 0.6f, size.height)
-                ),
-                cornerRadius = r
-            )
-            // ③ 斜向流光
-            drawRoundRect(
-                brush = Brush.linearGradient(
-                    colors = listOf(Color.White.copy(alpha = if (dark) 0.10f else 0.55f), Color.Transparent),
-                    start = Offset(size.width * 0.12f, 0f),
-                    end = Offset(size.width * 0.88f, size.height * 0.95f)
-                ),
+                color = if (dark) Color(0xFF2E2A26).copy(alpha = 0.85f) else Color.White.copy(alpha = 0.85f),
                 cornerRadius = r
             )
             // ④ 顶部镜面线（中间最亮、两头淡出）
@@ -257,7 +260,8 @@ fun Modifier.glassSurface(
     dark: Boolean,
     ring: Boolean = false,
     elevation: Dp = 5.dp,
-    clipContent: Boolean = true
+    clipContent: Boolean = true,
+    strokeInset: Dp = 0.dp
 ): Modifier {
     return this
         .shadow(
@@ -271,69 +275,56 @@ fun Modifier.glassSurface(
             val corner = CornerRadius(cr, cr)
             val line = 1.dp.toPx()
 
-            // ① 玻璃体
+            // ② 卡身：纯白（深色用暖深 #2E2A26）+ 0.85 透明度
+            //    （2026-10-03 用户：透明度再小小拉高 —— 0.80 → 0.85）
             drawRoundRect(
-                brush = Brush.linearGradient(
-                    colors = if (dark) listOf(Color.White.copy(alpha = 0.20f), Color.White.copy(alpha = 0.07f))
-                    else listOf(Color.White.copy(alpha = 0.42f), Color.White.copy(alpha = 0.14f)),
-                    start = Offset.Zero,
-                    end = Offset(size.width * 0.75f, size.height)
-                ),
+                color = if (dark) Color(0xFF2E2A26).copy(alpha = 0.85f) else Color.White.copy(alpha = 0.85f),
                 cornerRadius = corner
             )
 
-            // 深色下背景本身就暗，白线对比被放大 → 亮度要压得比亮色低一档，
-            // 否则边缘会出现一条条"贴上去的白色硬线"
-            val topA = if (dark) 0.20f else 0.95f
-            val botA = if (dark) 0.09f else 0.30f
-            val leftA = if (dark) 0.09f else 0.55f
-            val rightA = if (dark) 0.035f else 0.28f
+            // ②½ 柔和层：卡身越透，透进来的背景细节就越硬（一眼看出是"没做模糊"）。
+            //    这里在卡身下面铺一层半径很小的圆形渐变（亮 0.55），把背景细节压柔一点点。
+            //    只画亮色：深色下这层白渐变叠在深卡底上 = 正中间一团白色光晕（用户反馈），
+            //    而深色背景本来就暗、透进来的细节几乎看不见，这层在深色下纯属多余。
+            if (!dark) {
+                drawRoundRect(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            Color.White.copy(alpha = 0.55f),
+                            Color.White.copy(alpha = 0f)
+                        ),
+                        center = Offset(size.width * 0.5f, size.height * 0.5f),
+                        radius = size.minDimension * 0.72f
+                    ),
+                    cornerRadius = corner
+                )
+            }
 
-            // ② 顶部高光
+            // ③ 描边护眼（用户 2026-10-03 从对照页选定 ④）：
+            //    一条顶光（亮 0.85 / 深 0.20）+ 整圈 1px 淡描边
+            //    （亮色浅紫 #5A4B96@0.16 / 深色白@0.14）—— 深浅模式都做（用户点名"深色也不要拉下"）。
+            //    底光 / 左右光去掉：有了整圈描边它们反而多余。
             drawRoundRect(
                 brush = Brush.horizontalGradient(
-                    listOf(Color.Transparent, Color.White.copy(alpha = topA), Color.Transparent)
+                    listOf(Color.Transparent, Color.White.copy(alpha = if (dark) 0.20f else 0.85f), Color.Transparent)
                 ),
                 topLeft = Offset(size.width * 0.06f, 0f),
                 size = Size(size.width * 0.88f, line),
                 cornerRadius = CornerRadius(line / 2, line / 2)
             )
-            // ③ 底部反光
-            drawRoundRect(
-                brush = Brush.horizontalGradient(
-                    listOf(Color.Transparent, Color.White.copy(alpha = botA), Color.Transparent)
-                ),
-                topLeft = Offset(size.width * 0.12f, size.height - line),
-                size = Size(size.width * 0.76f, line * 0.85f),
-                cornerRadius = CornerRadius(line / 2, line / 2)
-            )
-            // ④ 左右内侧亮边：两端淡出（原来是硬切头尾，圆角处会被形状斜切出硬口）
-            fun sideBar(x: Float, alpha: Float, topFrac: Float, heightFrac: Float) = drawRoundRect(
-                brush = Brush.verticalGradient(
-                    listOf(
-                        Color.White.copy(alpha = 0f),
-                        Color.White.copy(alpha = alpha),
-                        Color.White.copy(alpha = 0f)
-                    )
-                ),
-                topLeft = Offset(x, size.height * topFrac),
-                size = Size(line * 0.9f, size.height * heightFrac),
-                cornerRadius = CornerRadius(line / 2, line / 2)
-            )
-            sideBar(line * 0.6f, leftA, 0.06f, 0.82f)
-            sideBar(size.width - line * 1.5f, rightA, 0.12f, 0.72f)
-            // ⑤ 深色专用：沿圆角的柔和描边（直线条在深色下太硬，而且是会被圆角切）
-            if (dark) {
+            if (strokeInset.value > 0f) {
+                // 内缩描边：薄卡片（账目行）描边贴边会显得框格太满，往里收一点（对照页 C 方案）
+                val si = strokeInset.toPx()
                 drawRoundRect(
-                    brush = Brush.linearGradient(
-                        listOf(
-                            Color.White.copy(alpha = 0.16f),
-                            Color.White.copy(alpha = 0.11f),
-                            Color.White.copy(alpha = 0.03f)
-                        ),
-                        start = Offset(0f, 0f),
-                        end = Offset(size.width * 0.9f, size.height)
-                    ),
+                    color = if (dark) Color.White.copy(alpha = 0.14f) else Color(0xFF5A4B96).copy(alpha = 0.16f),
+                    topLeft = Offset(si, si),
+                    size = Size(size.width - si * 2f, size.height - si * 2f),
+                    cornerRadius = CornerRadius((cr - si).coerceAtLeast(0f), (cr - si).coerceAtLeast(0f)),
+                    style = Stroke(line)
+                )
+            } else {
+                drawRoundRect(
+                    color = if (dark) Color.White.copy(alpha = 0.14f) else Color(0xFF5A4B96).copy(alpha = 0.16f),
                     cornerRadius = corner,
                     style = Stroke(line)
                 )
@@ -353,16 +344,37 @@ fun glassBorder(width: Dp = 1.dp): BorderStroke =
     BorderStroke(width, Brush.linearGradient(listOf(Color.White.copy(alpha = 0.85f), Color.White.copy(alpha = 0.15f))))
 
 /** 底层柔光色斑：让上面的半透明卡片"有东西可透" */
+/** 柔光色斑的实际绘制：屏幕背景和"背景副本"都必须走这一份，否则玻璃里的背景会错位 */
+fun DrawScope.drawColorBlobs(dark: Boolean) {
+    // 亮色色斑强度 0.90 → 0.55 → 0.42（2026-10-03 两次调淡：
+    // 卡片透出来的就是背景颜色，"条目发灰发脏"的根子在背景强度，不在卡片本身；
+    // 背景越淡，透进来的越是纯白。深色保持 0.42 不动 —— 深色下色斑是唯一彩色来源。）
+    val a = if (dark) 0.42f else 0.42f
+    drawRect(if (dark) Color(0xFF0E0F12) else Color(0xFFF4F2FB))
+    fun blob(color: Color, alpha: Float, sizeDp: Float, xDp: Float, yDp: Float, right: Boolean, bottom: Boolean) {
+        val r = (sizeDp / 2f).dp.toPx()
+        val cx = if (right) size.width + xDp.dp.toPx() - r else xDp.dp.toPx() + r
+        val cy = if (bottom) size.height + yDp.dp.toPx() - r else yDp.dp.toPx() + r
+        val c = Offset(cx, cy)
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(color.copy(alpha = alpha), color.copy(alpha = 0f)),
+                center = c, radius = r
+            ),
+            radius = r, center = c
+        )
+    }
+    blob(Color(0xFFFF8E7A), a, 360f, -110f, -90f, right = false, bottom = false)
+    blob(Color(0xFF7FA9FF), a * 0.92f, 320f, 90f, 30f, right = true, bottom = false)
+    blob(Color(0xFFFFC98A), a * 0.88f, 340f, 100f, -40f, right = true, bottom = true)
+    blob(Color(0xFF8FE8C0), a * 0.82f, 320f, -90f, 60f, right = false, bottom = true)
+}
+
 @Composable
 fun ColorBlobsBackground(isDark: Boolean) {
-    val a = if (isDark) 0.42f else 0.90f
-    Box(Modifier.fillMaxSize().background(if (isDark) Color(0xFF0E0F12) else Color(0xFFF4F2FB))) {
-        Blob(Color(0xFFFF8E7A), a, Modifier.align(Alignment.TopStart).offset(x = (-110).dp, y = (-90).dp), 360.dp)
-        Blob(Color(0xFF7FA9FF), a * 0.92f, Modifier.align(Alignment.TopEnd).offset(x = 90.dp, y = 30.dp), 320.dp)
-        Blob(Color(0xFFFFC98A), a * 0.88f, Modifier.align(Alignment.BottomEnd).offset(x = 100.dp, y = (-40).dp), 340.dp)
-        Blob(Color(0xFF8FE8C0), a * 0.82f, Modifier.align(Alignment.BottomStart).offset(x = (-90).dp, y = 60.dp), 320.dp)
-    }
+    androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) { drawColorBlobs(isDark) }
 }
+
 
 @Composable
 private fun Blob(color: Color, alpha: Float, mod: Modifier, size: Dp) {

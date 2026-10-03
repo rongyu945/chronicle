@@ -35,6 +35,17 @@ object DateUtils {
     /** 某个月的日历（日=1） */
     fun month(year: Int, month0: Int): Calendar = todayCal().apply { set(year, month0, 1) }
 
+    /** 当月 1 号 00:00 的毫秒（按展示的 年/月） */
+    fun monthStartMs(year: Int, month0: Int): Long =
+        todayCal().apply { set(year, month0, 1, 0, 0, 0) }.timeInMillis
+
+    /** 当月末最后一天 23:59:59.999 的毫秒 */
+    fun monthEndMs(year: Int, month0: Int): Long {
+        val c = todayCal().apply { set(year, month0, 1, 0, 0, 0) }
+        c.add(Calendar.MONTH, 1); c.add(Calendar.MILLISECOND, -1)
+        return c.timeInMillis
+    }
+
     fun daysInMonth(year: Int, month0: Int): Int =
         month(year, month0).getActualMaximum(Calendar.DAY_OF_MONTH)
 
