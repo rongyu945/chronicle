@@ -3,17 +3,23 @@ package com.rongyu.shixuji.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
+import androidx.room.withTransaction
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -21,13 +27,18 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
@@ -40,7 +51,7 @@ import com.rongyu.shixuji.DEFAULT_TAB_ORDER
 import com.rongyu.shixuji.FONT_SCALES
 import com.rongyu.shixuji.data.AccTagEntity
 import com.rongyu.shixuji.data.Account
-import com.rongyu.shixuji.data.ApiModelEntity
+import com.rongyu.shixuji.data.AppDatabase
 import com.rongyu.shixuji.data.AppPref
 import com.rongyu.shixuji.data.LoopTodo
 import com.rongyu.shixuji.data.QuickEntry
@@ -53,13 +64,25 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
 
-/** 标签可选色（12 色）：红/橙/黄/绿/青/蓝/紫/紫红/玫红/棕/灰/墨绿 */
-private val TAG_COLORS = listOf(
-    0xFFFF5F3C, 0xFFFF9F0A, 0xFFFFD60A, 0xFF34C759, 0xFF30B0C7, 0xFF1E9EF0,
-    0xFFAF52DE, 0xFF5A6CF0, 0xFFFF2D55, 0xFF8B6A4B, 0xFF8E8E93, 0xFF0A5C3C
+/**
+ * 标签可选色（24 色，按色系分成 6 行）：红系 / 橙黄系 / 绿系 / 青蓝系 / 紫粉系 / 中性系。
+ *
+ * 用户 2026-10-14：「原来 12 色太单调，颜色再丰富一点、选择更多一点」→ 12 → 24，
+ * 每行 4 色、行首标色系，一眼能挑到想要的那一档。
+ * 注意：颜色是**按值存进标签记录**的（AccTag.color），所以换色板不会改动已有标签的颜色；
+ * 旧 12 色全部保留在新色板里（老标签进编辑器仍然能高亮出自己那一格）。
+ */
+private val TAG_COLOR_GROUPS: List<Pair<String, List<Long>>> = listOf(
+    "红系" to listOf(0xFFFF3B30, 0xFFFF5F3C, 0xFFFF2D55, 0xFFD0021B),
+    "橙黄系" to listOf(0xFFFF9500, 0xFFFF9F0A, 0xFFFFD60A, 0xFFC9A227),
+    "绿系" to listOf(0xFF34C759, 0xFF8BC34A, 0xFF6B8E23, 0xFF0A5C3C),
+    "青蓝系" to listOf(0xFF30B0C7, 0xFF32ADE6, 0xFF1E9EF0, 0xFF5A6CF0),
+    "紫粉系" to listOf(0xFFAF52DE, 0xFF7C4DFF, 0xFFF06292, 0xFFD98880),
+    "中性系" to listOf(0xFF8E8E93, 0xFF2C2C2E, 0xFF8B6A4B, 0xFFD8C3A5)
 )
+private val TAG_COLORS: List<Long> = TAG_COLOR_GROUPS.flatMap { it.second }
 
-/** 设置（按《时序集-设置详情页细节.md》：待办/账单/大模型列表/界面显示/关于作者） */
+/** 设置（按《时序集-设置详情页细节.md》：待办 / 账单 / 界面显示 / 数据 / 关于作者） */
 @Composable
 fun SettingsScreen(
     isSongti: Boolean,
@@ -84,6 +107,10 @@ fun SettingsScreen(
     }
     val collapseT by animateFloatAsState(if (collapsed) 1f else 0f, tween(200), label = "navCollapseS")
 
+    // 每次进入本页都回到最上面（和待办/账目一致）；
+    // 不重置就会保留上次滚到的位置，切过来看到的是设置列表末尾。
+    LaunchedEffect(Unit) { scrollState.scrollTo(0) }
+
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         // 标题条：往上滑字号缩小、边距收紧（背景透明）
         Text("设置",
@@ -104,7 +131,7 @@ fun SettingsScreen(
         Column(
             Modifier.weight(1f).fillMaxWidth().verticalScroll(scrollState)
                 .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 150.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(9.dp)
         ) {
 
             SectionCard("待办") {
@@ -116,9 +143,7 @@ fun SettingsScreen(
                 NavRow("月度预算", "超支会提示") { page = "budget" }
                 NavRow("常用记账", "一键记一笔") { page = "quick" }
                 NavRow("账单总览", "按月查看") { page = "bills" }
-            }
-            SectionCard("大模型列表") {
-                NavRow("模型管理", "模型 / Key") { page = "models" }
+                NavRow("支出明细", "标签占比饼图") { page = "pie" }
             }
             SectionCard("界面显示设置") {
                 SwitchRow("使用宋体", isSongti, onToggleSongti)
@@ -183,7 +208,7 @@ private fun SwitchRow(label: String, checked: Boolean, onToggle: (Boolean) -> Un
 
 @Composable
 private fun NavRow(label: String, value: String, onClick: () -> Unit = {}) {
-    Row(Modifier.fillMaxWidth().clickable { onClick() }.padding(horizontal = 16.dp).padding(vertical = 10.dp),
+    Row(Modifier.fillMaxWidth().clickable { onClick() }.padding(horizontal = 16.dp).padding(vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically) {
         Text(label, fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
         Text(value, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -203,7 +228,9 @@ private fun ColumnScope.SettingSubPage(
     onApplyOrder: (List<String>) -> Unit
 ) {
     // 二级页：标题行固定在外、内容滚动（标题同样往上滑缩小：20sp → 14sp）
+    // key = page：换一个二级页要回到顶部，否则会把上一个页面的滚动位置带过来
     val subScroll = rememberScrollState()
+    LaunchedEffect(page) { subScroll.scrollTo(0) }
     val subCollapsed by remember { derivedStateOf { subScroll.value > 24 } }
     val subCollapseT by animateFloatAsState(if (subCollapsed) 1f else 0f, tween(200), label = "navCollapseSub")
 
@@ -221,7 +248,8 @@ private fun ColumnScope.SettingSubPage(
             Text(when (page) {
                 "loop" -> "循环待办"; "export" -> "导出未完成待办"
                 "tags" -> "标签管理"; "bills" -> "账单总览"
-                "models" -> "模型管理"; "order" -> "底栏排序"
+                "pie" -> "支出明细"
+                "order" -> "底栏排序"
                 "budget" -> "月度预算"; "quick" -> "常用记账"
                 "backup" -> "备份 / 恢复"
                 else -> "设置"
@@ -236,7 +264,7 @@ private fun ColumnScope.SettingSubPage(
             "export" -> ExportUndonePage()
             "tags" -> TagManagePage()
             "bills" -> BillsOverviewPage()
-            "models" -> ModelManagePage()
+            "pie" -> ExpensePiePage()
             "order" -> TabOrderPage(tabOrder, onApplyOrder, onBack)
             "budget" -> BudgetPage()
             "quick" -> QuickEntryPage()
@@ -251,7 +279,6 @@ class SettingsViewModel : ViewModel() {
     private val todoDao = AppContainer.database.todoDao()
     private val loopDao = AppContainer.database.loopTodoDao()
     private val tagDao = AppContainer.database.accTagDao()
-    private val modelDao = AppContainer.database.apiModelDao()
     private val accountDao = AppContainer.database.accountDao()
     private val prefDao = AppContainer.database.appPrefDao()
     private val quickDao = AppContainer.database.quickEntryDao()
@@ -259,7 +286,6 @@ class SettingsViewModel : ViewModel() {
     val todos = todoDao.observeAll()
     val loops = loopDao.observeAll()
     val tags = tagDao.observeAll()
-    val models = modelDao.observeAll()
     val accounts = accountDao.observeAll()
     val quickEntries = quickDao.observeAll()
 
@@ -275,8 +301,24 @@ class SettingsViewModel : ViewModel() {
     fun toggleLoop(id: Long, done: Boolean) = viewModelScope.launch { loopDao.setDone(id, done) }
     fun deleteLoop(id: Long) = viewModelScope.launch { loopDao.delete(id) }
 
-    fun addTag(name: String, color: Long) = viewModelScope.launch { tagDao.upsert(AccTagEntity(name = name, color = color)) }
-    fun updateTag(id: Long, name: String, color: Long) = viewModelScope.launch { tagDao.update(id, name, color) }
+    /** 新建标签：同名就直接改那一条的颜色，别插出两条一模一样的（列表里分不清） */
+    fun addTag(name: String, color: Long) = viewModelScope.launch(Dispatchers.IO) {
+        val same = tagDao.getAll().firstOrNull { it.name == name }
+        if (same != null) tagDao.update(same.id, name, color)
+        else tagDao.upsert(AccTagEntity(name = name, color = color))
+    }
+
+    /**
+     * 改标签。**改名必须同时改账目里的 tag 字符串** —— 账目是按名字关联的，
+     * 只改 acc_tags.name 会让老账目全变孤儿（灰点、饼图掉「其他」）。
+     * 两件事放同一个事务里，避免改一半。
+     */
+    fun updateTag(tag: AccTagEntity, newName: String, color: Long) = viewModelScope.launch(Dispatchers.IO) {
+        AppContainer.database.withTransaction {
+            if (newName != tag.name) accountDao.renameTag(tag.name, newName)
+            tagDao.update(tag.id, newName, color)
+        }
+    }
 
     suspend fun countByTag(name: String): Int = accountDao.countByTag(name)
 
@@ -286,24 +328,33 @@ class SettingsViewModel : ViewModel() {
         tagDao.delete(tag.id)
     }
 
-    fun addModel(m: ApiModelEntity) = viewModelScope.launch { modelDao.insert(m) }
-    fun updateModel(m: ApiModelEntity) = viewModelScope.launch {
-        modelDao.update(m.id, m.modelName, m.quota, m.resetDate, m.resetCycle, m.baseUrl, m.apiKey, m.keyName, m.platform, m.color)
-    }
-    fun deleteModel(id: Long) = viewModelScope.launch { modelDao.delete(id) }
 
     // ===== 备份 / 恢复 =====
+    /**
+     * 备份文件格式版本。
+     * 改动任何一张表的字段/含义（或 buildBackupJson 的输出结构）时都要 +1，
+     * 这样将来恢复旧文件才能知道"这份文件是什么年代导的、缺哪些字段"。
+     * 1 = 初版（漏 priority/sortOrder/doneAt）；2 = 补齐 todos 三项 + 记 dbVersion/appVersion。
+     */
+    companion object { const val BACKUP_SCHEMA = 2 }
+
     suspend fun buildBackupJson(): String = withContext(Dispatchers.IO) {
         val root = JSONObject()
         root.put("app", "时序集")
-        root.put("schema", 1)
+        root.put("schema", BACKUP_SCHEMA)
         root.put("exportedAt", System.currentTimeMillis())
+        // 数据库版本与 App 版本：恢复时用来判断"这份文件来自哪一版、字段够不够"
+        root.put("dbVersion", AppDatabase.DB_VERSION)
+        root.put("appVersion", BuildConfig.VERSION_NAME)
 
         val todosArr = JSONArray()
         todoDao.getAll().forEach { t ->
             todosArr.put(JSONObject().apply {
                 put("id", t.id); put("title", t.title); put("detail", t.detail)
                 put("done", t.done); put("dueDate", t.dueDate); put("createdAt", t.createdAt)
+                // 这三个漏掉会静默丢数据：恢复后所有优先级变「无」、拖动顺序被打乱、
+                // 已完成分区的先后也丢了（早期版本确实漏了，这里补上）
+                put("priority", t.priority); put("sortOrder", t.sortOrder); put("doneAt", t.doneAt)
             })
         }
         root.put("todos", todosArr)
@@ -334,16 +385,6 @@ class SettingsViewModel : ViewModel() {
         }
         root.put("accTags", tagArr)
 
-        val modelArr = JSONArray()
-        modelDao.getAll().forEach { m ->
-            modelArr.put(JSONObject().apply {
-                put("id", m.id); put("modelName", m.modelName); put("quota", m.quota)
-                put("resetDate", m.resetDate); put("resetCycle", m.resetCycle); put("baseUrl", m.baseUrl)
-                put("apiKey", m.apiKey); put("keyName", m.keyName); put("platform", m.platform); put("color", m.color)
-            })
-        }
-        root.put("apiModels", modelArr)
-
         val quickArr = JSONArray()
         quickDao.getAll().forEach { q ->
             quickArr.put(JSONObject().apply {
@@ -366,6 +407,12 @@ class SettingsViewModel : ViewModel() {
     suspend fun restoreFromJson(json: String): Int = withContext(Dispatchers.IO) {
         val root = try { JSONObject(json) } catch (_: Exception) { return@withContext -1 }
         if (root.optJSONArray("todos") == null && root.optJSONArray("accounts") == null) return@withContext -1
+
+        // 旧版文件（schema 1）没有 priority/sortOrder/doneAt，取默认 0 即可；
+        // 将来 schema 再升，这里按来源版本分支处理，别一律当新版读。
+        val srcSchema = root.optInt("schema", 1)
+        if (srcSchema > BACKUP_SCHEMA) return@withContext -2   // 来自更新的版本，字段可能读不懂
+
         var n = 0
 
         todoDao.clear()
@@ -374,7 +421,11 @@ class SettingsViewModel : ViewModel() {
                 val o = arr.getJSONObject(i)
                 todoDao.insert(Todo(id = o.optLong("id"), title = o.optString("title"),
                     detail = o.optString("detail"), done = o.optBoolean("done"),
-                    dueDate = o.optLong("dueDate"), createdAt = o.optLong("createdAt")))
+                    dueDate = o.optLong("dueDate"), createdAt = o.optLong("createdAt"),
+                    // 旧备份文件里没有这三项 → optInt/optLong 取默认 0，行为与从前一致
+                    priority = o.optInt("priority", 0),
+                    sortOrder = o.optInt("sortOrder", 0),
+                    doneAt = o.optLong("doneAt", 0L)))
                 n++
             }
         }
@@ -404,18 +455,6 @@ class SettingsViewModel : ViewModel() {
                 val o = arr.getJSONObject(i)
                 tagDao.upsert(AccTagEntity(id = o.optLong("id"), name = o.optString("name"),
                     color = o.optLong("color"), icon = o.optString("icon")))
-                n++
-            }
-        }
-        modelDao.clear()
-        root.optJSONArray("apiModels")?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                modelDao.insert(ApiModelEntity(id = o.optLong("id"), modelName = o.optString("modelName"),
-                    quota = o.optString("quota"), resetDate = o.optString("resetDate"),
-                    resetCycle = o.optString("resetCycle"), baseUrl = o.optString("baseUrl"),
-                    apiKey = o.optString("apiKey"), keyName = o.optString("keyName"),
-                    platform = o.optString("platform"), color = o.optLong("color", 0xFF0A84FF)))
                 n++
             }
         }
@@ -515,7 +554,7 @@ private fun LoopTodoPage(vm: SettingsViewModel = viewModel()) {
 private fun TabOrderPage(current: List<String>, onApplyOrder: (List<String>) -> Unit, onBack: () -> Unit) {
     val initial = remember(current) {
         val m = current.filter { it in DEFAULT_TAB_ORDER }
-        if (m.size == 4) m else DEFAULT_TAB_ORDER
+        if (m.size == DEFAULT_TAB_ORDER.size) m else DEFAULT_TAB_ORDER
     }
     var order by remember(initial) { mutableStateOf(initial) }
     var draggingLabel by remember { mutableStateOf<String?>(null) }
@@ -666,7 +705,7 @@ private fun TagManagePage(vm: SettingsViewModel = viewModel()) {
         var color by remember(tag.id) { mutableStateOf(tag.color) }
         TagEditorDialog("修改标签", name, color,
             onName = { name = it }, onColor = { color = it },
-            onConfirm = { vm.updateTag(tag.id, name.trim(), color); editing = null },
+            onConfirm = { vm.updateTag(tag, name.trim(), color); editing = null },
             onDismiss = { editing = null })
     }
 
@@ -707,184 +746,137 @@ private fun TagEditorDialog(
                 OutlinedTextField(value = name, onValueChange = onName, label = { Text("标签名") },
                     singleLine = true, modifier = Modifier.fillMaxWidth())
                 Text("颜色：", fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.Start),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    TAG_COLORS.forEach { c ->
-                        val cl = c.toLong()
-                        Box(Modifier.size(28.dp).clickable { onColor(cl) }
-                            .background(Color(c).copy(alpha = if (color == cl) 1f else .4f), RoundedCornerShape(8.dp)))
-                    }
-                }
+                TagColorPicker(color) { onColor(it) }
             }
         },
         confirmButton = { TextButton(onClick = { if (name.isNotBlank()) onConfirm() }) { Text("保存") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
 }
 
-// ===== 模型管理 =====
-@OptIn(ExperimentalMaterial3Api::class)
+/** 标签颜色选择器：24 个色块 8×3 平铺，**不写色系名** —— 直接看颜色挑（用户 2026-10-14：不要色系名称） */
 @Composable
-private fun ModelManagePage(vm: SettingsViewModel = viewModel()) {
-    val models by vm.models.collectAsState(initial = emptyList())
-    var editing by remember { mutableStateOf<ApiModelEntity?>(null) }
-    var showAdd by remember { mutableStateOf(false) }
-    var showAddKey by remember { mutableStateOf(false) }
-    var deleteTarget by remember { mutableStateOf<ApiModelEntity?>(null) }
-
-    Column {
-        LabelText("添加 / 管理 AI 模型与 API Key，看板将读取此处", 13, MaterialTheme.colorScheme.onSurfaceVariant)
-        models.forEach { m ->
-            Card(Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                shape = RoundedCornerShape(12.dp)) {
-                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(30.dp).background(Color(m.color.toInt()).copy(alpha = .8f), RoundedCornerShape(8.dp)),
-                        contentAlignment = Alignment.Center) {
-                        Text(m.modelName.take(1), color = Color.White, fontSize = 14.sp)
-                    }
-                    Column(Modifier.weight(1f).padding(start = 10.dp)) {
-                        Text(m.modelName, fontSize = 15.sp)
-                        Text("${m.keyName} · ${m.baseUrl}", fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Text("改", color = MaterialTheme.colorScheme.primary, fontSize = 13.sp,
-                        modifier = Modifier.clickable { editing = m }.padding(8.dp))
-                    Text("删", color = MaterialTheme.colorScheme.error, fontSize = 13.sp,
-                        modifier = Modifier.clickable { deleteTarget = m }.padding(8.dp))
-                }
+private fun TagColorPicker(selected: Long, onPick: (Long) -> Unit) {
+    // 老标签用的是旧色板的颜色（不在下面 24 色里）→ 顶上单独放一格它的原色 + 「当前」，
+    // 否则打开修改会一个圈都不亮，像是颜色丢了。
+    val legacy = TAG_COLORS.none { it == selected }
+    Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (legacy) {
+            Row(verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Swatch(selected, Color(selected).luminance() > 0.45f, true, onPick)
+                Text("当前", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { showAdd = true }, modifier = Modifier.weight(1f)) { Text("添加模型") }
-            OutlinedButton(onClick = { showAddKey = true }, enabled = models.isNotEmpty(),
-                modifier = Modifier.weight(1f)) { Text("添加 Key") }
+        TAG_COLORS.chunked(8).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                row.forEach { c -> Swatch(c, Color(c).luminance() > 0.45f, c == selected, onPick) }
+            }
         }
-    }
-
-    if (showAdd) {
-        ModelEditDialog(editing = null, onConfirm = { vm.addModel(it); showAdd = false }, onDismiss = { showAdd = false })
-    }
-
-    editing?.let { m ->
-        ModelEditDialog(editing = m, onConfirm = { vm.updateModel(it); editing = null }, onDismiss = { editing = null })
-    }
-
-    deleteTarget?.let { m ->
-        AlertDialog(
-            shape = GlassDialogShape,
-            containerColor = glassDialogContainer(),
-            modifier = glassDialogModifier(),
-            onDismissRequest = { deleteTarget = null },
-            title = { Text("删除这条模型记录？") },
-            text = { Text("${m.modelName} · ${m.keyName}") },
-            confirmButton = {
-                TextButton(onClick = { vm.deleteModel(m.id); deleteTarget = null },
-                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("删除") }
-            },
-            dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("取消") } })
-    }
-
-    // 添加 Key：给已有模型加一条新 Key（只需选模型 + Key 名称 + Key 值）
-    if (showAddKey) {
-        val uniqueModels = remember(models) { models.map { it.modelName }.distinct() }
-        var pickModel by remember { mutableStateOf(uniqueModels.firstOrNull() ?: "") }
-        var pickOpen by remember { mutableStateOf(false) }
-        var newKey by remember { mutableStateOf("") }
-        var newKeyName by remember { mutableStateOf("") }
-        AlertDialog(
-            shape = GlassDialogShape,
-            containerColor = glassDialogContainer(),
-            modifier = glassDialogModifier(),
-            onDismissRequest = { showAddKey = false }, title = { Text("添加 Key") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("所选模型的 URL / 额度 / 平台将自动复用", fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    ExposedDropdownMenuBox(expanded = pickOpen, onExpandedChange = { pickOpen = !pickOpen }) {
-                        OutlinedTextField(value = pickModel, onValueChange = {}, readOnly = true,
-                            label = { Text("选择模型") },
-                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = pickOpen) },
-                            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth())
-                        ExposedDropdownMenu(expanded = pickOpen, onDismissRequest = { pickOpen = false }) {
-                            uniqueModels.forEach { nm ->
-                                DropdownMenuItem(text = { Text(nm) }, onClick = { pickModel = nm; pickOpen = false })
-                            }
-                        }
-                    }
-                    OutlinedTextField(value = newKeyName, onValueChange = { newKeyName = it },
-                        label = { Text("Key 名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = newKey, onValueChange = { newKey = it },
-                        label = { Text("API Key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    if (pickModel.isNotBlank() && newKey.isNotBlank()) {
-                        models.firstOrNull { it.modelName == pickModel }?.let { base ->
-                            vm.addModel(ApiModelEntity(
-                                modelName = base.modelName, quota = base.quota, resetDate = base.resetDate,
-                                resetCycle = base.resetCycle, baseUrl = base.baseUrl, apiKey = newKey,
-                                keyName = newKeyName.ifBlank { base.keyName }, platform = base.platform, color = base.color))
-                            showAddKey = false
-                        }
-                    }
-                }) { Text("保存") }
-            },
-            dismissButton = { TextButton(onClick = { showAddKey = false }) { Text("取消") } })
     }
 }
 
-/** 添加 / 修改模型共用弹窗（editing == null 表示新增） */
-@OptIn(ExperimentalMaterial3Api::class)
+/** 单格色块：亮色底用黑描边、深色底用白描边（选中的才画） */
 @Composable
-private fun ModelEditDialog(
-    editing: ApiModelEntity?,
-    onConfirm: (ApiModelEntity) -> Unit,
-    onDismiss: () -> Unit
-) {
-    val key = editing?.id
-    var name by remember(key) { mutableStateOf(editing?.modelName ?: "") }
-    var quota by remember(key) { mutableStateOf(editing?.quota ?: "") }
-    var rdate by remember(key) { mutableStateOf(editing?.resetDate ?: "") }
-    var rcyc by remember(key) { mutableStateOf(editing?.resetCycle ?: "") }
-    var url by remember(key) { mutableStateOf(editing?.baseUrl ?: "") }
-    var keyName by remember(key) { mutableStateOf(editing?.keyName ?: "") }
-    var apiKey by remember(key) { mutableStateOf(editing?.apiKey ?: "") }
-    var plat by remember(key) { mutableStateOf(editing?.platform ?: "") }
+private fun Swatch(color: Long, light: Boolean, on: Boolean, onPick: (Long) -> Unit) {
+    val ring = if (light) Color.Black.copy(alpha = .75f) else Color.White.copy(alpha = .9f)
+    Box(
+        Modifier.size(28.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color(color))
+            .then(if (on) Modifier.border(2.5.dp, ring, RoundedCornerShape(8.dp)) else Modifier)
+            .clickable { onPick(color) }
+    )
+}
 
-    AlertDialog(
-            shape = GlassDialogShape,
-            containerColor = glassDialogContainer(),
-            modifier = glassDialogModifier(),
-            onDismissRequest = onDismiss,
-        title = { Text(if (editing == null) "添加模型" else "修改模型") },
-        text = {
-            Column(
-                Modifier.heightIn(max = 430.dp).verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("模型名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = quota, onValueChange = { quota = it }, label = { Text("额度") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = rdate, onValueChange = { rdate = it }, label = { Text("重置日期") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = rcyc, onValueChange = { rcyc = it }, label = { Text("重置周期") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = url, onValueChange = { url = it }, label = { Text("Base URL") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = keyName, onValueChange = { keyName = it }, label = { Text("Key 名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, label = { Text("API Key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = plat, onValueChange = { plat = it }, label = { Text("开放平台链接") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+// ===== 支出明细（饼图：有标签按标签分，没标签的并成「其他」） =====
+/** 一个扇区：名称（标签名或「其他」）、金额（分）、颜色 */
+private class PieSlice(val name: String, val cents: Long, val color: Color)
+
+@Composable
+private fun ExpensePiePage(vm: SettingsViewModel = viewModel()) {
+    val accounts by vm.accounts.collectAsState(initial = emptyList())
+    val tags by vm.tags.collectAsState(initial = emptyList())
+    val today = DateUtils.todayCal()
+    var y by remember { mutableIntStateOf(today.get(Calendar.YEAR)) }
+    var m0 by remember { mutableIntStateOf(today.get(Calendar.MONTH)) }
+
+    // 只统计「支出」（type==0）；收入不进饼图
+    val monthOut = remember(accounts, y, m0) {
+        val s = DateUtils.monthStartMs(y, m0)
+        val e = DateUtils.monthEndMs(y, m0)
+        accounts.filter { it.type == 0 && it.date in s..e }
+    }
+    val total = monthOut.sumOf { it.amountCents }
+    // 按标签分组：有标签 → 名字=标签名、颜色=标签色（标签被删过对不上色时退灰）；
+    // 没标签 → 全部并成「其他」（灰点同账目页的无标签灰）。
+    val slices = remember(monthOut, tags) {
+        val tagColor = tags.associate { it.name to Color(it.color.toInt()) }
+        monthOut.groupBy { it.tag.trim() }
+            .map { (tag, list) ->
+                if (tag.isEmpty()) PieSlice("其他", list.sumOf { it.amountCents }, Color(0xFFC7C7CC))
+                else PieSlice(tag, list.sumOf { it.amountCents }, tagColor[tag] ?: Color(0xFF8E8E93))
             }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                if (name.isNotBlank()) {
-                    onConfirm(ApiModelEntity(
-                        id = editing?.id ?: 0, modelName = name.trim(), quota = quota, resetDate = rdate,
-                        resetCycle = rcyc, baseUrl = url, apiKey = apiKey,
-                        keyName = keyName.ifBlank { "default" }, platform = plat,
-                        color = editing?.color ?: 0xFF0A84FF))
+            .filter { it.cents > 0 }
+            // 有标签的按金额从大到小，「其他」永远排最后（垫底参考，不跟标签抢位）
+            .sortedWith(compareBy<PieSlice> { it.name == "其他" }.thenByDescending { it.cents })
+    }
+
+    Column {
+        // 月份切换：和账单总览同款 ‹ X年X月 ›
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("‹", fontSize = 22.sp, modifier = Modifier.clickable {
+                val (ny, nm) = DateUtils.addMonths(y, m0, -1); y = ny; m0 = nm
+            }.padding(end = 10.dp))
+            Text("${y}年${m0 + 1}月", fontSize = 16.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
+            Text("›", fontSize = 22.sp, modifier = Modifier.clickable {
+                val (ny, nm) = DateUtils.addMonths(y, m0, 1); y = ny; m0 = nm
+            }.padding(start = 10.dp))
+        }
+        Spacer(Modifier.height(16.dp))
+
+        if (total <= 0L) {
+            Text("本月没有支出记录", fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp), textAlign = TextAlign.Center)
+        } else {
+            Text("本月支出合计 ${formatCents(total)}", fontSize = 15.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+            Spacer(Modifier.height(12.dp))
+            // 饼图：drawArc(useCenter=true) 从 12 点方向顺时针铺扇区。
+            // 最后一片用「360 - 已用角度」收尾，避免浮点误差在接缝处漏出一条发丝缝。
+            Canvas(Modifier.fillMaxWidth().height(240.dp)) {
+                val r = size.minDimension / 2f
+                val topLeft = Offset(center.x - r, center.y - r)
+                var start = -90f
+                slices.forEachIndexed { i, s ->
+                    val sweep = if (i == slices.lastIndex) 360f - start
+                        else s.cents.toFloat() / total.toFloat() * 360f
+                    drawArc(color = s.color, startAngle = start, sweepAngle = sweep,
+                        useCenter = true, topLeft = topLeft, size = Size(r * 2f, r * 2f))
+                    start += sweep
                 }
-            }) { Text("保存") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
+            }
+            Spacer(Modifier.height(16.dp))
+            // 图例：色点 + 名称 + 占比 + 金额（图例和饼图同一份 slices，顺序一致）
+            slices.forEach { s ->
+                val pct = s.cents.toDouble() / total.toDouble() * 100.0
+                Row(Modifier.fillMaxWidth().padding(vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(10.dp).background(s.color, CircleShape))
+                    Text(s.name, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(start = 8.dp).weight(1f))
+                    Text(String.format("%.1f%%", pct), fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.width(52.dp), textAlign = TextAlign.End)
+                    Text(formatCents(s.cents), fontSize = 14.sp, fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(start = 10.dp).width(92.dp), textAlign = TextAlign.End)
+                }
+            }
+        }
+    }
 }
 
 // ===== 账单总览 =====
@@ -976,9 +968,8 @@ private fun BillsOverviewPage(vm: SettingsViewModel = viewModel()) {
                 modifier = Modifier.padding(top = 10.dp, bottom = 4.dp))
             list.forEach { acc ->
                 Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-                    Text(DateUtils.formatTime(acc.date), fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(accountTitle(acc), fontSize = 14.sp, modifier = Modifier.weight(1f).padding(start = 10.dp))
+                    // 条目界面不显示时间（用户要求）；具体时刻仍能在账目详情弹窗和导出文件里看到
+                    Text(accountTitle(acc), fontSize = 14.sp, modifier = Modifier.weight(1f))
                     Text(formatCents(if (acc.type == 1) acc.amountCents else -acc.amountCents),
                         fontSize = 14.sp, color = if (acc.type == 1) incomeGreen else MaterialTheme.colorScheme.onSurface)
                 }
@@ -1065,23 +1056,93 @@ private fun buildAccountExport(acc: List<Account>, fmt: String): String {
 private fun BackupPage(vm: SettingsViewModel = viewModel()) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    var pendingBackup by remember { mutableStateOf<String?>(null) }
-    var confirmRestore by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
+    /** 一次性把文本交给下一个启动器：onClick 里赋值，launcher 回调里取走并清空 */
+    var textForPicker by remember { mutableStateOf<String?>(null) }
+    var suggestedName by remember { mutableStateOf("时序集备份.json") }
+    /** true = 这次导出只是「某个动作的副产物」（如恢复前自动备份），成功与否说法不同 */
+    var isAutoBackup by remember { mutableStateOf(false) }
+    /** 点「从备份文件恢复」后先做自动备份，备份流程收尾时再弹确认框 */
+    var wantRestore by remember { mutableStateOf(false) }
+    var confirmRestore by remember { mutableStateOf(false) }
 
+    fun stampName(): String {
+        val c = DateUtils.calAt(System.currentTimeMillis())
+        val p = { v: Int -> v.toString().padStart(2, '0') }
+        return "时序集备份_${c.get(Calendar.YEAR)}${p(c.get(Calendar.MONTH) + 1)}${p(c.get(Calendar.DAY_OF_MONTH))}" +
+            "_${p(c.get(Calendar.HOUR_OF_DAY))}${p(c.get(Calendar.MINUTE))}${p(c.get(Calendar.SECOND))}.json"
+    }
+
+    /** 把 json 存到外部（用户自己挑位置），用于「导出备份」按钮 */
     val createLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json")
     ) { uri ->
-        val text = pendingBackup
+        val text = textForPicker
         if (uri != null && text != null) {
-            try {
+            val ok = try {
                 ctx.contentResolver.openOutputStream(uri)?.use { out -> out.write(text.toByteArray(Charsets.UTF_8)) }
-                toast(ctx, "备份已保存")
+                true
             } catch (e: Exception) {
-                toast(ctx, "备份失败：${e.message}")
+                toast(ctx, "备份失败：${e.message}"); false
             }
+            if (ok) toast(ctx, "备份已保存")
         }
-        pendingBackup = null
+        textForPicker = null
+        isAutoBackup = false
+        // 自动备份这一环结束 → 该弹恢复确认框了
+        if (wantRestore) { wantRestore = false; confirmRestore = true }
+    }
+
+    /**
+     * 「分享备份」：先把 json 写进自己的 cacheDir/backup_share/，再用 FileProvider 生成
+     * content:// uri 交给系统分享面板（微信 / 邮件 / 网盘 / 蓝牙都能收）。
+     * 比「导出备份文件」更省事：不用在文件选择器里找目录。
+     */
+    fun shareBackup(json: String) {
+        try {
+            val dir = java.io.File(ctx.cacheDir, "backup_share").apply { mkdirs() }
+            // 清掉上一次的，免得 cache 里越堆越多
+            dir.listFiles()?.forEach { it.delete() }
+            val f = java.io.File(dir, stampName())
+            f.writeText(json, Charsets.UTF_8)
+            val uri = FileProvider.getUriForFile(ctx, "com.rongyu.shixuji.fileprovider", f)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "application/json"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "时序集备份")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            ctx.startActivity(Intent.createChooser(send, "分享备份文件"))
+        } catch (e: Exception) {
+            toast(ctx, "分享失败：${e.message}")
+        }
+    }
+
+    /**
+     * 恢复前的自动备份：先写进自己的 cacheDir，再用 FileProvider 交给系统「另存为」。
+     * 不能用 CreateDocument 直接拿 uri 写——没有权限；也不能静默写外部存储。
+     * 结果就是：点一次恢复，会先让你选个地方存当前数据，存完才问「确认恢复？」。
+     */
+    val autoBackupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        val text = textForPicker
+        if (uri == null || text == null) {
+            // 用户取消了自动备份 → 不往下走，避免他还没备份就被覆盖
+            textForPicker = null; wantRestore = false; isAutoBackup = false
+            toast(ctx, "已取消，未做任何修改")
+            return@rememberLauncherForActivityResult
+        }
+        val ok = try {
+            ctx.contentResolver.openOutputStream(uri)?.use { out -> out.write(text.toByteArray(Charsets.UTF_8)) }
+            true
+        } catch (e: Exception) {
+            toast(ctx, "自动备份失败：${e.message}"); false
+        }
+        textForPicker = null
+        isAutoBackup = false
+        if (ok) { toast(ctx, "已自动备份当前数据"); confirmRestore = true }
+        else wantRestore = false
     }
 
     val openLauncher = rememberLauncherForActivityResult(
@@ -1095,11 +1156,13 @@ private fun BackupPage(vm: SettingsViewModel = viewModel()) {
                         ctx.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
                     } catch (_: Exception) { "" }
                 }
-                if (text.isBlank()) {
-                    toast(ctx, "读取文件失败")
-                } else {
-                    val n = vm.restoreFromJson(text)
-                    toast(ctx, if (n >= 0) "已恢复 $n 条记录" else "文件格式不正确")
+                when {
+                    text.isBlank() -> toast(ctx, "读取文件失败")
+                    else -> when (val n = vm.restoreFromJson(text)) {
+                        -2 -> toast(ctx, "这个备份来自更新的版本，请先升级 App")
+                        -1 -> toast(ctx, "文件格式不正确")
+                        else -> toast(ctx, "已恢复 $n 条记录")
+                    }
                 }
                 busy = false
             }
@@ -1107,32 +1170,52 @@ private fun BackupPage(vm: SettingsViewModel = viewModel()) {
     }
 
     Column {
-        LabelText("把待办 / 账目 / 标签 / 模型 / 设置导出为一个 JSON 文件，换机或重装后可以完整恢复。",
+        LabelText("把待办 / 账目 / 标签 / 设置导出为一个 JSON 文件，换机或重装后可以完整恢复。",
             13, MaterialTheme.colorScheme.onSurfaceVariant)
 
         Button(onClick = {
             if (busy) return@Button
             busy = true
             scope.launch {
-                val json = vm.buildBackupJson()
+                textForPicker = vm.buildBackupJson()
                 busy = false
-                pendingBackup = json
-                val stamp = DateUtils.calAt(System.currentTimeMillis()).let { c ->
-                    "${c.get(Calendar.YEAR)}${c.get(Calendar.MONTH) + 1}${c.get(Calendar.DAY_OF_MONTH)}"
-                }
-                createLauncher.launch("时序集备份_$stamp.json")
+                isAutoBackup = false
+                suggestedName = stampName()
+                createLauncher.launch(suggestedName)
             }
         }, enabled = !busy, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
             Text(if (busy) "处理中…" else "导出备份文件")
         }
 
-        OutlinedButton(onClick = { confirmRestore = true }, enabled = !busy,
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
-            Text("从备份文件恢复")
+        OutlinedButton(onClick = {
+            if (busy) return@OutlinedButton
+            busy = true
+            scope.launch {
+                shareBackup(vm.buildBackupJson())
+                busy = false
+            }
+        }, enabled = !busy, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Text("分享备份文件")
         }
 
-        LabelText("注意：恢复会先清空当前全部记录，再写入备份中的内容，请确认文件来源。",
-            12, MaterialTheme.colorScheme.error)
+        OutlinedButton(onClick = {
+            // 先备份、再恢复：这一串走完才弹「确认恢复？」
+            if (busy) return@OutlinedButton
+            busy = true
+            scope.launch {
+                textForPicker = vm.buildBackupJson()
+                busy = false
+                isAutoBackup = true
+                wantRestore = true
+                suggestedName = "恢复前自动备份_" + stampName().removePrefix("时序集备份_")
+                autoBackupLauncher.launch(suggestedName)
+            }
+        }, enabled = !busy, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Text(if (busy) "处理中…" else "从备份文件恢复")
+        }
+
+        LabelText("恢复前会先让你把当前数据存一份（强烈建议存），确认后再选择要恢复的备份文件。",
+            12, MaterialTheme.colorScheme.onSurfaceVariant)
     }
 
     if (confirmRestore) {
@@ -1142,7 +1225,7 @@ private fun BackupPage(vm: SettingsViewModel = viewModel()) {
             modifier = glassDialogModifier(),
             onDismissRequest = { confirmRestore = false },
             title = { Text("确认恢复？") },
-            text = { Text("当前所有待办、账目、标签、模型记录都会被备份文件中的内容替换。此操作不可撤销，建议先导出一份当前备份。") },
+            text = { Text("当前所有待办、账目、标签都会被备份文件中的内容替换。此操作不可撤销，你刚才已经存了一份当前数据的备份。") },
             confirmButton = {
                 TextButton(onClick = { confirmRestore = false; openLauncher.launch(arrayOf("application/json", "*/*")) }) { Text("选择文件") }
             },

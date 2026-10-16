@@ -67,10 +67,17 @@ object DateUtils {
     /** 只取一个字：一 / 二 / … / 日 */
     fun weekdayShortCn(c: Calendar): String = weekdayCn(c).substring(1)
 
-    /** 某天所在周的周一零点 */
+    /**
+     * 某天所在周的周一零点。
+     *
+     * 注意：不能用 `set(Calendar.DAY_OF_WEEK, MONDAY)` —— 它的结果取决于日历实例内部
+     * 残留的周字段（谁在什么时候 set 过什么），同一段代码在不同日期运行会得到相差
+     * 1~3 周的结果（实测 2026-10-25 的输入会得到 10-05）。改用「先算今天是周几、
+     * 再按天数差回退」的算术法，任何实例状态下都稳定得到同一周的周一。
+     */
     fun startOfWeek(cal: Calendar): Calendar {
         val c = cal.clone() as Calendar
-        c.set(Calendar.DAY_OF_WEEK, Calendar.MONDAY)
+        c.add(Calendar.DAY_OF_MONTH, 1 - isoDayOfWeek(c))
         c.set(Calendar.HOUR_OF_DAY, 0); c.set(Calendar.MINUTE, 0)
         c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0)
         return c

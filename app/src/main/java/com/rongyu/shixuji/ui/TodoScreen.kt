@@ -18,8 +18,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
@@ -31,6 +31,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -40,13 +41,18 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -69,8 +75,13 @@ import java.util.Calendar
 
 /** 玻璃底栏 + 悬浮按钮占用的底部高度，列表底部留白要够 */
 private val FAB_PLUS_BOTTOM = 92.dp
-private val FAB_TODAY_BOTTOM = 146.dp
+/** 「今」按钮：「＋」上方 56dp（2026-10-15 用户：再近一点；原 64dp 两钮之间空 20dp，现在空 12dp） */
+private val FAB_TODAY_OFFSET = 56.dp
+private val FAB_TODAY_BOTTOM = FAB_PLUS_BOTTOM + FAB_TODAY_OFFSET
 private val LIST_BOTTOM = 180.dp
+
+/** 列表条目统一最小高度：待办 / 循环 / 账目三种行完全一致（介于旧「无时间待办」与旧「带时间账目」之间） */
+internal val LIST_ROW_MIN_HEIGHT = 48.dp
 
 class TodoViewModel : ViewModel() {
     private val dao = AppContainer.database.todoDao()
@@ -82,10 +93,30 @@ class TodoViewModel : ViewModel() {
     /** 只取某一天的账目（下推到 SQL） */
     fun accountsBetween(start: Long, end: Long) = accDao.observeBetween(start, end)
 
+    /**
+     * 新增待办：排到最上面（用户 2026-10-14 定稿）。
+     *
+     * 做法是给它一个「比全表最小 sortOrder 再小 1」的手动顺序值：
+     *  - 列表按库顺序渲染（openOrder 由 dayOpen 初始化），所以它在当天列表里恒是第一行；
+     *  - 越新的条目值越小 → 新建的永远压在上一条新建的上面；
+     *  - 与 drag 重排兼容：拖动会给参与拖动的条目重编号为正数，新条目仍是负数、仍在最上面；
+     *  - 重建 App 后位置不变（以前只改内存里的顺序，重启就掉回当天列表最底下）。
+     */
     fun add(title: String, detail: String, dueDate: Long, priority: Int) =
         viewModelScope.launch(Dispatchers.IO) {
-            dao.insert(Todo(title = title, detail = detail, dueDate = dueDate, priority = priority))
+            dao.insert(Todo(title = title, detail = detail, dueDate = dueDate, priority = priority,
+                sortOrder = dao.minSortOrder() - 1))
         }
+
+    /**
+     * 新增并回传新条的 id（提示条的「撤回」要按 id 删）。
+     * 先算出 id 再插入 —— 不用等 insert 返回，界面仍是「保存即关弹窗」。
+     */
+    suspend fun addReturningId(title: String, detail: String, dueDate: Long, priority: Int): Long {
+        val nextId = dao.nextId()
+        dao.insert(Todo(id = nextId, title = title, detail = detail, dueDate = dueDate, priority = priority))
+        return nextId
+    }
 
     fun update(id: Long, title: String, detail: String, dueDate: Long, priority: Int) =
         viewModelScope.launch(Dispatchers.IO) {
@@ -93,19 +124,53 @@ class TodoViewModel : ViewModel() {
             dao.setPriority(id, priority)
         }
 
-    fun toggle(id: Long, done: Boolean) = viewModelScope.launch(Dispatchers.IO) { dao.setDone(id, done) }
-    fun delete(id: Long) = viewModelScope.launch(Dispatchers.IO) { dao.delete(id) }
+    /** 修改并回传「改之前」的完整快照 + 改之前的手动顺序（提示条的「撤回」要整条还原） */
+    suspend fun updateReturningOld(
+        id: Long, title: String, detail: String, dueDate: Long, priority: Int
+    ): Todo? {
+        val old = dao.getById(id) ?: return null
+        dao.update(id, title, detail, dueDate)
+        dao.setPriority(id, priority)
+        return old
+    }
 
-    /** 撤销删除：按原 id 原字段插回 */
-    fun restore(t: Todo) = viewModelScope.launch(Dispatchers.IO) {
-        dao.insert(t.copy(id = t.id))
+    /** 整条覆盖（撤回修改用；id / sortOrder 保留原样） */
+    fun restoreFull(t: Todo) = viewModelScope.launch(Dispatchers.IO) {
+        dao.upsert(t.copy(id = t.id))
         dao.setSortOrder(t.id, t.sortOrder)
     }
 
-    /** 手动拖动排序：按当前顺序整体重编号 */
+    fun toggle(id: Long, done: Boolean) = viewModelScope.launch(Dispatchers.IO) { dao.setDone(id, done) }
+
+    /**
+     * 勾选 / 取消勾选待办：同时写「完成时刻」。
+     * 完成 → 立刻沉到当天列表最下方的「已完成」分区（用户要的自动收缩），
+     * doneAt = 完成那一刻，已完成分区按它倒序（最近完成的排最前）。
+     */
+    fun toggleFull(t: Todo, done: Boolean) = viewModelScope.launch(Dispatchers.IO) {
+        dao.setDoneFull(t.id, done, if (done) System.currentTimeMillis() else t.doneAt)
+    }
+
+    fun delete(id: Long) = viewModelScope.launch(Dispatchers.IO) { dao.delete(id) }
+
+    /** 撤销删除：按原 id 原字段插回（upsert：万一 id 已被新条占用也不会崩） */
+    fun restore(t: Todo) = viewModelScope.launch(Dispatchers.IO) {
+        dao.upsert(t.copy(id = t.id))
+        dao.setSortOrder(t.id, t.sortOrder)
+    }
+
+    /**
+     * 手动拖动排序：整批一次性编号（顺序表里的 id 各自拿到自己的下标）。
+     * 一次落库（不逐条 update 触发 Flow 抖动），且**不覆盖**未参与拖动的条目原有顺序 ——
+     * 老实现给所有条目重编号、顺序表里又没有已完成那些，会把它们的顺序抹成同一档。
+     *
+     * 编号从 **0** 起（原来从 1 起）：新条目用的是负数（见 add），若是 1..n
+     * 就会把「没拖过 = sortOrder 0」的老条目全顶到拖动过的条目前面 ——
+     * 重建 App（openOrder 重置、改按库顺序渲染）时顺序就乱了。0 起则库顺序与手动顺序一致。
+     */
     fun reorder(ids: List<Long>) = viewModelScope.launch(Dispatchers.IO) {
         AppContainer.database.withTransaction {
-            ids.forEachIndexed { i, id -> dao.setSortOrder(id, i + 1) }
+            ids.forEachIndexed { i, id -> dao.setSortOrder(id, i) }
         }
     }
 
@@ -122,6 +187,10 @@ fun TodoScreen(
     todayTick: Long = 0L,
     vm: TodoViewModel = viewModel()
 ) {
+    // 悬浮玻璃钮（＋「今」）自己的背景层：只录**列表内容那一层**，不含按钮本身。
+    // ⚠️ 绝不能借底栏那份 backdrop —— 那份把按钮自己也录进去了，玻璃采样自己 = 渲染树递归，
+    //    实测直接 native 栈溢出崩溃（libhwui RenderNode::prepareTreeImpl 递归 500+ 层）。
+    val fabLayer = rememberLiquidGlassBackdrop()
     val todos by vm.todos.collectAsState(initial = emptyList())
     val loops by vm.loops.collectAsState(initial = emptyList())
 
@@ -133,17 +202,40 @@ fun TodoScreen(
     var shownDayMs by rememberSaveable { mutableLongStateOf(DateUtils.todayCal().timeInMillis) }
     val shownDay = remember(shownDayMs) { DateUtils.calFrom(shownDayMs) }
 
+    // ★ 每个「显示日」一个独立的 LazyListState（普通 Map 当缓存，不是 Compose 状态）。
+    //
+    // 为什么不继续用「一个共享 state + 切天时 scrollToItem(0) 纠回来」：
+    // PeriodSwipe 左右两侧那两页用的是各自的 state（天生停在第 0 条），所以手指拖动时
+    // 看到的确实是新一天的第一条；可 onCommit 那一刻中心页换成共享 state，
+    // 而它记的还是**上一天**滚到的位置（比如滚在「过往未完成」那一段）——
+    // 松手后画面先显示新一天的中段、再被纠回顶部，观感就是
+    // 「先显示过往待办（或没有类别的条目），过一会才刷新出当天的内容」。
+    // 按天缓存 state 后，侧页和落位后的中心页是**同一个实例**：滑进来看到什么就留什么，
+    // 一帧都不用纠。（离开的日子会被清掉，所以下次再翻回来仍然是从顶部开始。）
+    val dayStates = remember { mutableMapOf<Long, LazyListState>() }
+    val shownDayStartMs = DateUtils.startOfDayMs(shownDayMs)
+    fun dayListState(dayMs: Long) = dayStates.getOrPut(dayMs) { LazyListState() }
+    val listState = dayListState(shownDayStartMs)
+    LaunchedEffect(shownDayStartMs) {
+        val c = DateUtils.calFrom(shownDayStartMs)
+        val keep = (-1..1).map { DateUtils.startOfDayMs(DateUtils.addDays(c, it).timeInMillis) }.toHashSet()
+        dayStates.keys.retainAll(keep)
+    }
+
     // 大标题折叠：列表一滚动，标题从 28sp 收到 17sp，并浮出半透明标题条
-    val listState = rememberLazyListState()
     val collapsed by remember {
         derivedStateOf { listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 36 }
     }
     val collapseT by animateFloatAsState(if (collapsed) 1f else 0f, tween(200), label = "navCollapse")
 
+    // 切换日期后列表从最顶部开始显示由「按天缓存 LazyListState」天然保证（见上），
+    // 不需要再在切天时 scrollToItem(0) 去纠 —— 那种「先显示旧位置、再纠回来」
+    // 正是用户看到的「先显示中段、过一会才刷新」。
+
     // 保存后把当天列表滚回顶部，保证刚加的那条一定在眼前
     val scrollScope = rememberCoroutineScope()
     var showAdd by remember { mutableStateOf(false) }
-    var deleteTarget by remember { mutableStateOf<Todo?>(null) }
+    var detailTarget by remember { mutableStateOf<Todo?>(null) }
     var editTarget by remember { mutableStateOf<Todo?>(null) }
     val undo = rememberUndoController()
 
@@ -213,6 +305,17 @@ fun TodoScreen(
         levelName = TodoLevel.WEEK.name
     }
 
+    /**
+     * 保存后只有「那条的日期」和当前显示日**不是同一天**才跳过去。
+     * 同一天时原地不动（用户 2026-10-12 明确：新建后不要自动跳到那条置顶展示的位置，
+     * 保持当前页面；回顶由「当天数据变化」那个 LaunchedEffect 统一负责）。
+     */
+    fun jumpToDayIfNeeded(dueMs: Long) {
+        val target = if (dueMs == 0L) DateUtils.startOfDayMs(today.timeInMillis) else DateUtils.startOfDayMs(dueMs)
+        if (target == dayStartMs) return
+        jumpToDay(dueMs)
+    }
+
     // 返回键：年/月视图按返回降级到周视图，周视图不拦截（交给系统）
     BackHandler(enabled = level != TodoLevel.WEEK) {
         if (level == TodoLevel.YEAR) { shownYear = shownDay.get(Calendar.YEAR); shownMonth = shownDay.get(Calendar.MONTH) }
@@ -220,7 +323,7 @@ fun TodoScreen(
     }
 
     Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().recordBackdrop(fabLayer)) {
             TodoHeader(
                 level, shownYear, shownMonth, shownDay,
                 titleSize = (28f - 11f * collapseT).sp,
@@ -283,16 +386,15 @@ fun TodoScreen(
                         val pageDay = remember(shownDayMs, off) {
                             DateUtils.addDays(DateUtils.calFrom(shownDayMs), 7 * off)
                         }
-                        // 从周日切到下周一 = 跨周：整条周条的 7 格会同时换掉，硬切会出现
-                        // "卡一下"。这里按「周」做一次快速淡换，跨周就不再是硬跳。
-                        val weekKey = remember(pageDay) { DateUtils.startOfWeek(pageDay).timeInMillis }
-                        Crossfade(targetState = weekKey, animationSpec = tween(150), label = "weekFade") {
-                            WeekNavView(
-                                evDays, pageDay,
-                                onSelectDay = { shownDayMs = it.timeInMillis },
-                                dragFrac = { dayFrac.floatValue }
-                            )
-                        }
+                        // 跨周时整条周条的 7 格会同时换掉。原来这里套了一层 Crossfade(150ms)：
+                        // 它只在跨周时命中，会把整条周条**同时合成两份**并各建离屏图层——
+                        // 实测跨周最差帧 ≈1095ms（周内 ≈323ms），正是"跨周卡一下"的元凶之一。
+                        // 去掉后数字瞬换，反而顺。
+                        WeekNavView(
+                            evDays, pageDay,
+                            onSelectDay = { shownDayMs = it.timeInMillis },
+                            dragFrac = { dayFrac.floatValue }
+                        )
                     }
                     Spacer(Modifier.height(2.dp))
                     // —— 待办列表区：左右滑动切换一天 ——
@@ -305,23 +407,56 @@ fun TodoScreen(
                             shownDayMs = DateUtils.addDays(DateUtils.calFrom(shownDayMs), dir).timeInMillis
                         }
                     ) { off ->
-                        // 中心页沿用共享 listState（大标题折叠跟着它走），两侧各自独立
-                        val slotState = if (off == 0) listState else remember(off) { LazyListState() }
                         val pageDay = remember(shownDayMs, off) {
                             DateUtils.addDays(DateUtils.calFrom(shownDayMs), off)
                         }
+                        // 按「这一天」取 state：中心页和侧页拿到的是同一个实例，
+                        // 所以滑进来时看到的位置就是落位后保留的位置（不再跳回上一天的偏移）
+                        val slotState = dayListState(DateUtils.startOfDayMs(pageDay.timeInMillis))
+                        // 侧页（不是当前显示日）只要它那天变了，就先归零：
+                        // 保证「跟着手指滑进来的那一页」永远是从第一条开始的，
+                        // 而且落位后中心页用的就是这个 state —— 松手瞬间不会跳到上一天的偏移。
+                        // 归零用 scrollToItem（瞬时）而不是动画：侧页此刻在屏幕外，没有人会看到这一下，
+                        // 但用动画的话落位后可能还在滚，正是「先显示中段、过一会才刷新」的来源。
+                        LaunchedEffect(off, DateUtils.startOfDayMs(pageDay.timeInMillis)) {
+                            if (off != 0) slotState.scrollToItem(0)
+                        }
+                        // ★ 回顶同账目页：挂在「当天待办集合」上，等数据真的变了再滚。
+                        // 旧写法是保存时 scrollScope.launch { listState.scrollToItem(0) }，
+                        // 和写库并行 —— 滚动常先执行、数据还没到，等 Flow 推来新条目时
+                        // LazyColumn 按 key 把原先可见那一条锚在原位，新条目插到它上面看不见。
+                        // 这里仍然只由「数据变化」触发（不在保存回调里滚），但用
+                        // animateScrollToItem 而不是 requestScrollToItem：后者是**瞬间**跳位，
+                        // 停在底部时整页从尾瞬移到头，用户 2026-10-14 反馈「跳起来很难看」；
+                        // 动画版是平滑滑上去，落点同样是第 0 条（新的那条就在最上面）。
+                        val pageStartMs = DateUtils.startOfDayMs(pageDay.timeInMillis)
+                        val pageEndMs = DateUtils.endOfDayMs(pageStartMs)
+                        val pageKey = remember(todos, pageStartMs, pageEndMs) {
+                            val inDay = todos.count { it.dueDate in pageStartMs..pageEndMs }
+                            val overdue = todos.count { it.dueDate != 0L && it.dueDate < pageStartMs && !it.done }
+                            val noDue = if (DateUtils.isSameDay(pageDay, today)) todos.count { it.dueDate == 0L && !it.done } else 0
+                            inDay to (overdue + noDue)
+                        }
+                        LaunchedEffect(off, pageStartMs, pageKey) {
+                            if (off == 0) slotState.animateScrollToItem(0)
+                        }
                         DayTodoList(
                             todos = todos, loops = loops, shownDay = pageDay,
+                            // 循环待办：完成状态是「本周」维度、不是分区，照旧直接切
                             onToggle = vm::toggle,
-                            onLongPress = { deleteTarget = it },
+                            // 待办勾选：完成即沉底（自动收缩到「已完成」分区）
+                            onToggleTodo = vm::toggleFull,
+                            onOpenDetail = { detailTarget = it },
                             onToggleLoop = vm::toggleLoop,
                             onDeleteWithUndo = { t ->
                                 vm.delete(t.id)
                                 undo.show("已删除：${t.title}") { vm.restore(t) }
                             },
-                            onDoneWithUndo = { t ->
-                                vm.toggle(t.id, true)
-                                undo.show("已完成：${t.title}") { vm.toggle(t.id, false) }
+                            // 取消完成（并给撤回）：整条还原 + 完成时刻一起还原，
+                            // 否则「撤回」再勾上时 doneAt 会是老时间，条目被顶到已完成区最前面
+                            onRestoreTodo = { t ->
+                                vm.restoreFull(t)
+                                undo.show("已取消完成：${t.title}") { vm.toggleFull(t, true) }
                             },
                             onReorder = { ids -> vm.reorder(ids) },
                             onDeleteLoop = vm::deleteLoop,
@@ -364,19 +499,18 @@ fun TodoScreen(
         // 日历底部记账摘要：放在玻璃底栏上方
         AccSummaryBar(monthSurplus, { onOpenAccount() },
             Modifier.align(Alignment.BottomCenter).padding(bottom = 74.dp))
-        // 悬浮按钮直接用实心圆画，不用 FloatingActionButton（FAB 的阴影会浮出多边形亮边）。
-        // 涟漪被全局关掉了，所以这里用按压缩放补上点下去的反馈
-        val addPress = remember { MutableInteractionSource() }
-        Box(
-            Modifier.align(Alignment.BottomEnd)
-                .padding(20.dp).padding(bottom = FAB_PLUS_BOTTOM).size(44.dp)
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.primary)
-                .clickable(interactionSource = addPress, indication = null, role = Role.Button) { showAdd = true }
-                .pressScale(addPress)
-                .semantics { contentDescription = "新建待办" },
-            contentAlignment = Alignment.Center
-        ) { Text("+", fontSize = 22.sp, color = Color.White) }
+        // 悬浮按钮：磨砂玻璃版（和底栏同一套液态玻璃），仍自己画圆不用 FloatingActionButton
+        //（FAB 的阴影会浮出多边形亮边）。涟漪被全局关掉了，按压缩放提供点下去的反馈。
+        GlassCircleButton(
+            label = "+",
+            tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.62f),
+            fallbackColor = MaterialTheme.colorScheme.primary,
+            labelColor = Color.White,
+            contentDescription = "新建待办",
+            onClick = { showAdd = true },
+            backdrop = fabLayer,
+            modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp).padding(bottom = FAB_PLUS_BOTTOM)
+        )
         // “今”按钮：不在今天或不在周视图时出现（月/年视图翻远了也能一键回来）
         // "今"按钮：进出用缩放+淡入淡出，不要突然出现/消失
         AnimatedVisibility(
@@ -386,66 +520,87 @@ fun TodoScreen(
             modifier = Modifier.align(Alignment.BottomEnd)
         ) {
             val dark = isDarkTheme
-            val todayPress = remember { MutableInteractionSource() }
-            Box(
-                Modifier
-                    .padding(20.dp).padding(bottom = FAB_TODAY_BOTTOM).size(44.dp)
-                    .clip(CircleShape)
-                    .background(if (dark) Color(0xFF3A3A3C) else Color.White)
-                    .border(0.8.dp, if (dark) Color.White.copy(alpha = 0.18f) else Color(0xFFE5E5EA), CircleShape)
-                    .clickable(interactionSource = todayPress, indication = null, role = Role.Button) { goToday() }
-                    .pressScale(todayPress)
-                    .semantics { contentDescription = "回到今天" },
-                contentAlignment = Alignment.Center
-            ) { Text("今", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
+            GlassCircleButton(
+                label = "今",
+                tint = if (dark) Color.White.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.34f),
+                fallbackColor = if (dark) Color(0xFF3A3A3C) else Color.White,
+                labelColor = MaterialTheme.colorScheme.primary,
+                labelSize = 14.sp, labelBold = true,
+                contentDescription = "回到今天",
+                onClick = { goToday() },
+                backdrop = fabLayer,
+                modifier = Modifier.padding(20.dp).padding(bottom = FAB_TODAY_BOTTOM)
+            )
         }
         // 上移到两个悬浮按钮上方：原来 84dp 会盖住 bottom=74dp 的记账摘要小字
         UndoHost(undo, Modifier.align(Alignment.BottomCenter).padding(bottom = 132.dp))
     }
 
     // 新增 / 修改 共用一个弹窗，点一下卡片不再直接删除
+    //
+    // 保存（含提示条）**必须在这个页面的作用域里跑**：弹窗自己的 rememberCoroutineScope
+    // 会随弹窗关闭一起被取消 —— 之前把落库写在弹窗里，就会出现「界面弹了已添加、
+    // 库里其实没这条」和「撤回按钮点了没反应」（撤回要先把新条写进库拿到 id）。
     if (showAdd) {
-        TodoEditDialog(vm = vm, editing = null, defaultDueMs = dayStartMs,
-            onSaved = { due, t ->
-                jumpToDay(due)
-                scrollScope.launch { listState.scrollToItem(0) }
-                // 明确回执：告诉他加到了哪一天（也能一眼看出日期有没有跑偏）
-                // 原来这里会弹一条"已添加：xxx"的黑色提示条（当初排查"加了不显示"用的），
-                // 用户觉得又丑又多余 —— 现在保存后直接关闭弹窗并把列表滚到顶，反馈已经足够
+        TodoEditDialog(editing = null, defaultDueMs = dayStartMs,
+            onSave = { t, d, due, p ->
+                // 新增不再弹撤回提示条（用户 2026-10-12：只保留删除的撤回），直接落库即可
+                vm.add(t, d, due, p)
+                jumpToDayIfNeeded(due)
+                // 回顶不在这里做（会和写库赛跑，见列表区那段注释）
             },
             onDismiss = { showAdd = false })
     }
     editTarget?.let { t ->
-        TodoEditDialog(vm = vm, editing = t,
-            onSaved = { due, t2 ->
-                jumpToDay(due)
-                scrollScope.launch { listState.scrollToItem(0) }
-                undo.show("已保存：$t2 · ${DateUtils.formatDateCn(due)}") { /* 长按可修改/删除 */ }
+        TodoEditDialog(editing = t,
+            onSave = { nt, nd, due, p ->
+                scrollScope.launch {
+                    val old = vm.updateReturningOld(t.id, nt, nd, due, p)
+                    if (old != null) undo.show("已保存：$nt") { vm.restoreFull(old) }
+                }
+                jumpToDayIfNeeded(due)
+                // 回顶同上：交给「当天数据变化」统一处理
             },
             onDismiss = { editTarget = null })
     }
 
-    deleteTarget?.let { t ->
+    // 点击/长按条目 → 详情弹窗：完整显示标题、备注、优先级、日期，可直接修改/删除
+    detailTarget?.let { t ->
         AlertDialog(
             shape = GlassDialogShape,
             containerColor = glassDialogContainer(),
             modifier = glassDialogModifier(),
-            onDismissRequest = { deleteTarget = null },
-            title = { Text("这条待办", fontWeight = FontWeight.Bold) },
+            onDismissRequest = { detailTarget = null },
+            title = { Text("待办详情", fontWeight = FontWeight.Bold) },
             text = {
-                Text(buildString {
-                    append("「${t.title}」")
-                    if (t.dueDate != 0L) append(" · ${DateUtils.formatDateCn(t.dueDate)}")
-                })
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(t.title, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                    if (t.detail.isNotBlank()) {
+                        Text("备注：${t.detail}", fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    if (priorityLabel(t.priority).isNotBlank()) {
+                        Text("优先级：${priorityLabel(t.priority)}", fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text(
+                        if (t.dueDate != 0L) "日期：${DateUtils.formatDateCn(t.dueDate)}" else "日期：无期限",
+                        fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (t.done) {
+                        Text("已完成", fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
             },
             confirmButton = {
                 Row(horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = { deleteTarget = null }) { Text("取消") }
-                    TextButton(onClick = { editTarget = t; deleteTarget = null }) { Text("修改") }
+                    TextButton(onClick = { detailTarget = null }) { Text("关闭") }
+                    TextButton(onClick = { editTarget = t; detailTarget = null }) { Text("修改") }
                     TextButton(
                         onClick = {
                             vm.delete(t.id)
-                            deleteTarget = null
+                            detailTarget = null
                             undo.show("已删除：${t.title}") { vm.restore(t) }
                         },
                         colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
@@ -514,185 +669,6 @@ private fun TodoHeader(
     }
 }
 
-private fun heatLevel(count: Int): Int = when {
-    count <= 0 -> 0
-    count == 1 -> 1
-    count == 2 -> 2
-    count == 3 -> 3
-    else -> 4
-}
-
-private fun heatAlpha(level: Int): Float = when (level) {
-    1 -> 0.18f
-    2 -> 0.40f
-    3 -> 0.66f
-    else -> 1f
-}
-
-/** 一级：年视图（日期格按当天事项数量着色 = 热力图） */
-@Composable
-private fun YearNavView(
-    evCountOfMonth: Map<Int, Map<Int, Int>>, year: Int,
-    state: LazyListState, onSelectMonth: (Int, Int) -> Unit
-) {
-    LazyColumn(
-        state = state,
-        modifier = Modifier.fillMaxSize(),
-        // 240dp：滚到底时最后一排月卡能整体躲到右下角 ＋/今 两个悬浮按钮上方
-        contentPadding = PaddingValues(16.dp, 4.dp, 16.dp, 240.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        items(4) { row ->
-            // B 方案：这一行 3 个月各自需要几行，取最大值 —— 一行内 3 张卡严格等高，同时避免白补空行
-            val rowMin = (0..2).map { row * 3 + it }.filter { it < 12 }
-                .maxOfOrNull { rowsNeeded(year, it) } ?: 6
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (i in 0..2) {
-                    val m = row * 3 + i
-                    if (m < 12) MonthCard(evCountOfMonth, year, m, rowMin, onSelectMonth, Modifier.weight(1f))
-                }
-            }
-        }
-        item {
-            Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically) {
-                Text("少", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                for (a in listOf(0.18f, 0.40f, 0.66f, 1f)) {
-                    Box(Modifier.padding(horizontal = 2.dp).size(12.dp)
-                        .background(MaterialTheme.colorScheme.primary.copy(alpha = a), CircleShape))
-                }
-                Text("多", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-    }
-}
-
-private fun rowsNeeded(year: Int, m0: Int): Int {
-    val cells = DateUtils.leadingBlanks(year, m0) + DateUtils.daysInMonth(year, m0)
-    return (cells + 6) / 7          // 不足一行也算一行
-}
-
-@Composable
-private fun MonthCard(
-    evCountOfMonth: Map<Int, Map<Int, Int>>, year: Int, m0: Int, minRows: Int,
-    onClick: (Int, Int) -> Unit, mod: Modifier
-) {
-    val leading = DateUtils.leadingBlanks(year, m0)
-    val days = DateUtils.daysInMonth(year, m0)
-    val today = DateUtils.todayCal()
-    val grid = List(leading) { 0 } + (1..days)
-    // 补 0 到整行再切（保证每行固定 7 格、日期严格左对齐，月末不拉伸错列）；
-    // 补多少行 = max(本月真正需要的行数, 同一行 3 个月里的最大值) —— 绝不无条件补到 6 行，
-    // 否则只要不是 6 行的月份，卡片底下就白空一整行（用户报「月份和他的底差了那么多」）。
-    val totalRows = maxOf(rowsNeeded(year, m0), minRows)
-    val fixed = (grid + List(totalRows * 7 - grid.size) { 0 }).chunked(7)
-    val counts = evCountOfMonth[DateUtils.monthKey(year, m0)].orEmpty()
-    val shape = RoundedCornerShape(18.dp)
-    Card(mod.clickable { onClick(year, m0) },
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        border = glassBorder(),
-        shape = shape) {
-        Column(Modifier.padding(horizontal = 5.dp, vertical = 6.dp)) {
-            Text("${m0 + 1}月", fontSize = 14.sp, fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(bottom = 4.dp))
-            // 注意 lineHeight 必须给：主题里的 lineHeight(24sp) 比字号大得多，
-            // 排版会把行框居中、把基线推到行框下半部分，小圆里的小字就会被裁掉下半截。
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                listOf("一", "二", "三", "四", "五", "六", "日").forEach {
-                    Text(it, fontSize = 8.sp, lineHeight = 9.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
-                }
-            }
-            fixed.forEach { rowCells ->
-                Row(Modifier.height(16.dp).fillMaxWidth()) {
-                    rowCells.forEach { day ->
-                        var bg = Color.Transparent
-                        var fg: Color = MaterialTheme.colorScheme.onSurface
-                        var bold = false
-                        val cellToday = day != 0 && day == today.get(Calendar.DAY_OF_MONTH) &&
-                            m0 == today.get(Calendar.MONTH) && year == today.get(Calendar.YEAR)
-                        val level = if (day == 0) 0 else heatLevel(counts[day] ?: 0)
-                        if (cellToday) {
-                            bg = MaterialTheme.colorScheme.primary; fg = Color.White; bold = true
-                        } else if (day != 0) {
-                            if (level > 0) {
-                                bg = MaterialTheme.colorScheme.primary.copy(alpha = heatAlpha(level))
-                                if (level >= 3) { fg = Color.White; bold = true }
-                            } else {
-                                val dow = (day + leading - 1) % 7
-                                if (dow == 5 || dow == 6) fg = MaterialTheme.colorScheme.primary
-                            }
-                        }
-                        Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
-                            // 尺寸要小于列宽（3 列时每列约 13~15dp），否则圆形被压成椭圆、相邻还会粘住
-                            Box(Modifier.size(13.dp).background(bg, CircleShape), contentAlignment = Alignment.Center) {
-                                // lineHeight 同①：不给的话数字下半截会被 13dp 的小圆裁掉
-                                Text(if (day == 0) "" else "$day", fontSize = 8.sp, lineHeight = 10.sp,
-                                    color = if (day == 0) Color.Transparent else fg,
-                                    fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/** 二级：月视图 */
-@Composable
-private fun MonthNavView(evCountOfMonth: Map<Int, Map<Int, Int>>, year: Int, month: Int, onSelectDay: (Int) -> Unit) {
-    val today = DateUtils.todayCal()
-    val leading = DateUtils.leadingBlanks(year, month)
-    val days = DateUtils.daysInMonth(year, month)
-    val counts = evCountOfMonth[DateUtils.monthKey(year, month)].orEmpty()
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
-            listOf("一", "二", "三", "四", "五", "六", "日").forEach {
-                Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
-            }
-        }
-        val grid = List(leading) { 0 } + (1..days)
-        val padded = grid + List(42 - grid.size) { 0 }
-        padded.chunked(7).forEach { row ->
-            Row(Modifier.fillMaxWidth()) {
-                row.forEach { day ->
-                    val level = if (day == 0) 0 else heatLevel(counts[day] ?: 0)
-                    val isToday = day == today.get(Calendar.DAY_OF_MONTH) &&
-                        month == today.get(Calendar.MONTH) && year == today.get(Calendar.YEAR)
-                    val dow = (day + leading - 1) % 7
-                    val isWeekend = dow == 5 || dow == 6
-                    Box(
-                        Modifier.weight(1f).aspectRatio(1f).padding(2.dp)
-                            .background(
-                                when {
-                                    isToday -> MaterialTheme.colorScheme.primary
-                                    level > 0 -> MaterialTheme.colorScheme.primary.copy(alpha = heatAlpha(level))
-                                    else -> Color.Transparent
-                                }, CircleShape),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally,
-                            modifier = Modifier.clickable(enabled = day != 0) { if (day != 0) onSelectDay(day) }) {
-                            // 同上：lineHeight 显式给 21sp，否则继承 24sp 行高把数字在圆里顶偏
-                            Text(if (day == 0) "" else "$day", fontSize = 14.sp, lineHeight = 21.sp,
-                                color = when {
-                                    isToday -> Color.White
-                                    level >= 3 -> Color.White
-                                    isWeekend -> MaterialTheme.colorScheme.primary
-                                    else -> MaterialTheme.colorScheme.onSurface
-                                },
-                                fontWeight = if (isToday || level >= 3) FontWeight.Bold else FontWeight.Normal)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /** 三级：周视图 */
 @Composable
 private fun WeekNavView(
@@ -700,10 +676,13 @@ private fun WeekNavView(
     onSelectDay: (Calendar) -> Unit,
     dragFrac: () -> Float = { 0f }
 ) {
-    val start = DateUtils.startOfWeek(shownDay)
-    val days = (0..6).map { DateUtils.addDays(start, it) }
-    val today = DateUtils.todayCal()
-    val selIdx = days.indexOfFirst { DateUtils.isSameDay(it, shownDay) }.coerceAtLeast(0)
+    // remember：跨周时这一页的 7 天全变，不记住会每帧重算 7 次 Calendar 拷贝（周条很贵）
+    val start = remember(shownDay) { DateUtils.startOfWeek(shownDay) }
+    val days = remember(start) { (0..6).map { DateUtils.addDays(start, it) } }
+    val today = remember(start) { DateUtils.todayCal() }
+    val selIdx = remember(days, shownDay) {
+        days.indexOfFirst { DateUtils.isSameDay(it, shownDay) }.coerceAtLeast(0)
+    }
     val circle = 32.dp
     // 千万不要写 fillMaxSize：周条下面还有日列表，占满整页会让列表拿到 0 高度（列表什么都画不出来）
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
@@ -741,6 +720,8 @@ private fun WeekNavView(
                             else Color.Transparent, CircleShape), contentAlignment = Alignment.Center) {
                             // 数字画两层：常态色 + 白字。白字层按「被红圆盖住的程度」淡入，
                             // 所以红圆滑到一半时两个日期各白一半，不会出现"圆走了字还是白的"穿帮。
+                            // 淡出必须更快（×1.7）：白字在灰底/浅底上对比度低，拖远一点还留 2 成白
+                            // 就整格发糊，看不清是几号。
                             val num = "${d.get(Calendar.DAY_OF_MONTH)}"
                             val weight = if (isToday) FontWeight.Bold else FontWeight.Normal
                             Text(num, fontSize = 14.sp, lineHeight = 21.sp, fontWeight = weight,
@@ -748,7 +729,8 @@ private fun WeekNavView(
                             Text(num, fontSize = 14.sp, lineHeight = 21.sp, fontWeight = weight,
                                 color = Color.White,
                                 modifier = Modifier.graphicsLayer {
-                                    alpha = (1f - abs(i - (selIdx - dragFrac()))).coerceIn(0f, 1f)
+                                    val near = (1f - abs(i - (selIdx - dragFrac()))).coerceIn(0f, 1f)
+                                    alpha = (near * 1.7f).coerceIn(0f, 1f)
                                 })
                         }
                         Box(Modifier.padding(top = 5.dp).size(4.dp).background(
@@ -760,58 +742,124 @@ private fun WeekNavView(
     }
 }
 
-/** 日列表：当日待办 + 循环待办 + 过往未完成 + 无期限 */
+/** 日列表：当日待办（未完成） + 每日固定 + 过往未完成 + 无期限 + 已完成（沉底、默认折叠） */
 @Composable
 private fun DayTodoList(
     todos: List<Todo>, loops: List<LoopTodo>, shownDay: Calendar,
-    onToggle: (Long, Boolean) -> Unit, onLongPress: (Todo) -> Unit, onToggleLoop: (Long, Boolean) -> Unit,
-    onDeleteWithUndo: (Todo) -> Unit, onDoneWithUndo: (Todo) -> Unit, onReorder: (List<Long>) -> Unit,
+    onToggle: (Long, Boolean) -> Unit,
+    onToggleTodo: (Todo, Boolean) -> Unit, onOpenDetail: (Todo) -> Unit,
+    onToggleLoop: (Long, Boolean) -> Unit,
+    onDeleteWithUndo: (Todo) -> Unit, onRestoreTodo: (Todo) -> Unit,
+    onReorder: (List<Long>) -> Unit,
     onDeleteLoop: (Long) -> Unit, state: LazyListState, listModifier: Modifier = Modifier
 ) {
     // 归一化到当天零点：即使 shownDayMs 万一带了时刻，过滤区间也仍然是整天
     val startMs = DateUtils.startOfDayMs(shownDay.timeInMillis)
     val endMs = DateUtils.endOfDayMs(startMs)
     val isToday = DateUtils.isToday(shownDay)
-    val dayTodos = todos.filter { it.dueDate in startMs..endMs }
-    val overdueTodos = todos.filter { it.dueDate != 0L && it.dueDate < startMs && !it.done }
-    val noDueTodos = if (isToday) todos.filter { it.dueDate == 0L && !it.done } else emptyList()
-    val dayLoops = loops.filter { it.dayOfWeek == DateUtils.isoDayOfWeek(shownDay) }
+    // ⚠️ 这些过滤**必须 remember**：本组件被 PeriodSwipe 同时画三份（前天/今天/后天），
+    // 不 remember 的话每帧重组都把整个 todos 表过滤 3×5 遍、循环的列表还要 O(n²) 找位，
+    // 跨周时数据全变 → 一次重组要做 15 遍全表扫描 → 掉帧（实测跨周 100% jank、单帧 200ms，
+    // 周内只有 46ms）。改成按输入 remember 后只在数据/日期真的变了才算一次。
+    val dayAll = remember(todos, startMs, endMs) { todos.filter { it.dueDate in startMs..endMs } }
+    // 未完成在上、已完成（自动）沉到最下面那个分区
+    val dayOpen = remember(dayAll) { dayAll.filter { !it.done } }
+    val dayDone = remember(dayAll) { dayAll.filter { it.done }.sortedByDescending { it.doneAt } }
+    val overdueTodos = remember(todos, startMs) {
+        todos.filter { it.dueDate != 0L && it.dueDate < startMs && !it.done }
+    }
+    val noDueTodos = remember(todos, isToday) {
+        if (isToday) todos.filter { it.dueDate == 0L && !it.done } else emptyList()
+    }
+    val shownIsoDow = remember(shownDay, startMs) { DateUtils.isoDayOfWeek(shownDay) }
+    val dayLoops = remember(loops, shownIsoDow) { loops.filter { it.dayOfWeek == shownIsoDow } }
+    // 「已完成」默认折叠（跨天/重启都回到收起）；「过往未完成」默认展开、折叠按钮保留
+    //（4.5.0 曾把它默认收起，用户 2026-10-09 要求改回默认展开）
+    var doneExpanded by rememberSaveable(startMs) { mutableStateOf(false) }
+    var overdueExpanded by rememberSaveable(startMs) { mutableStateOf(true) }
 
     // 手动拖动排序：本地顺序（id 列表），拖动结束后整体落库
-    var localOrder by remember { mutableStateOf<List<Long>>(emptyList()) }
-    LaunchedEffect(dayTodos.map { it.id }) {
-        localOrder = dayTodos.map { it.id }
+    var openOrder by remember { mutableStateOf<List<Long>>(emptyList()) }
+    LaunchedEffect(dayOpen.map { it.id }) {
+        openOrder = dayOpen.map { it.id }
     }
-    val ordered = remember(localOrder, dayTodos) {
-        val byId = dayTodos.associateBy { it.id }
-        // 没被手动排过序的（sortOrder=0，即刚加进来的）排在最前 —— 否则新加的会落到列表最底下，
-        // 长一点的列表里用户根本看不到，看起来就像"加了没反应"
-        val rest = dayTodos.filter { t -> localOrder.none { it == t.id } }
-        val arranged = localOrder.mapNotNull { byId[it] }
-        rest + arranged
+    // 显示顺序就按这份顺序表来 —— 拖动中「显示」和「排序依据」是同一份数据，才不会对不上号
+    // remember：不然每帧重组都重算（旧写法 openOrder.none{} 嵌在 filter 里还是 O(n²)）
+    val orderedOpen = remember(openOrder, dayOpen) {
+        val byId = dayOpen.associateBy { it.id }
+        val inOrder = openOrder.toHashSet()
+        // 不在顺序表里的（刚加进来的）排在最前，否则新加的会落到列表最底下、用户看不到
+        dayOpen.filter { t -> t.id !in inOrder } + openOrder.mapNotNull { byId[it] }
     }
+
     var dragId by remember { mutableStateOf<Long?>(null) }
     var dragDy by remember { mutableFloatStateOf(0f) }
-    val rowPx = with(LocalDensity.current) { 62.dp.toPx() }
+    // 行高必须实测：原来写死 48dp 而行高是 56dp（+8dp 间距 = 64dp），
+    // 每格差 16dp 会一路累积，手指越往下拖越对不上（用户反馈的「体验不好」）。
+    // 取「没被拖走的那条」量（拖起的那条加了缩放，量它会偏大）。
+    // 初值 0 = 还没量到，用到时候再按 64dp 兜底（别写 64f —— 那是像素、不是 dp）。
+    var rowPx by remember { mutableFloatStateOf(0f) }
+    val density = LocalDensity.current
+    val dragScope = rememberCoroutineScope()
 
-    fun onDragStart(id: Long) { dragId = id; dragDy = 0f }
+    // 记录内容实际滚到哪了。自动滚动发生在协程里（下面 dragScope.launch），
+    // 而 onDragBy 是同步的 —— 不把滚动量减回来，每帧都会重复判断、
+    // 被拖那条会被一次性推过好几格（用户看到的就是「一拖就跳」）。
+    var edgeAccum by remember { mutableFloatStateOf(0f) }
+
+    fun onDragStart(id: Long) { dragId = id; dragDy = 0f; edgeAccum = 0f }
+
     fun onDragBy(delta: Float) {
         val id = dragId ?: return
         dragDy += delta
-        val cur = localOrder.indexOf(id)
-        if (cur < 0) return
-        if (dragDy > rowPx / 2 && cur < localOrder.size - 1) {
-            localOrder = localOrder.toMutableList().also { it.add(cur + 1, it.removeAt(cur)) }
-            dragDy -= rowPx
-        } else if (dragDy < -rowPx / 2 && cur > 0) {
-            localOrder = localOrder.toMutableList().also { it.add(cur - 1, it.removeAt(cur)) }
-            dragDy += rowPx
+
+        // 拖到列表上下边缘 → 自动滚动
+        // 补偿方式：内容往上滚 dyEdge，行的基准位置也跟着上移，所以 dragDy 要同步 +dyEdge，
+        // 让被拖的那条始终贴在手指底下（不补偿的话行会从手指下滑走）。
+        // edgeAccum 记着「已经滚掉多少、还没从 dragDy 里扣掉的量」，每帧最多扣 rowH/2 ——
+        // 不扣的话一次滚动会被反复计入，被拖那条瞬间窜过好几格。
+        val vh = state.layoutInfo.viewportSize.height.toFloat()
+        val step = 14f
+        val dyEdge = when {
+            dragDy < -vh * 0.35f -> -step
+            dragDy > vh * 0.35f -> step
+            else -> 0f
         }
+        if (dyEdge != 0f) {
+            dragScope.launch {
+                state.scrollBy(dyEdge)
+                edgeAccum += dyEdge
+            }
+        }
+        // 一次性从 dragDy 里减掉累积的滚动量（最多减一行，避免一帧跨多格）
+        if (edgeAccum != 0f) {
+            val rowH0 = if (rowPx > 1f) rowPx else with(density) { 64.dp.toPx() }
+            val take = edgeAccum.coerceIn(-rowH0, rowH0)
+            dragDy += take
+            edgeAccum -= take
+        }
+
+        var cur = openOrder.indexOf(id)
+        if (cur < 0) return
+        // 换位阈值 = 实测行高（含间距）的一半；循环写法应付「一帧里拖过好几格」
+        // rowPx 兜底：万一没量到（回调没触发），退到 64dp 对应的像素，别用 64f 这种"像素值"
+        val rowH = if (rowPx > 1f) rowPx else with(density) { 64.dp.toPx() }
+        var list = openOrder
+        while (dragDy > rowH / 2f && cur < list.size - 1) {
+            list = list.toMutableList().also { it.add(cur + 1, it.removeAt(cur)) }
+            dragDy -= rowH; cur++
+        }
+        while (dragDy < -rowH / 2f && cur > 0) {
+            list = list.toMutableList().also { it.add(cur - 1, it.removeAt(cur)) }
+            dragDy += rowH; cur--
+        }
+        if (list !== openOrder) openOrder = list
     }
+
     fun onDragFinish() {
         val id = dragId
-        dragId = null; dragDy = 0f
-        if (id != null) onReorder(localOrder)
+        dragId = null; dragDy = 0f; edgeAccum = 0f
+        if (id != null) onReorder(openOrder)
     }
 
     LazyColumn(
@@ -819,44 +867,49 @@ private fun DayTodoList(
         // 和周条同处一个 Column：必须用 weight 吃剩余高度，用 fillMaxSize 会让列表底部伸出页面
         modifier = listModifier,
         contentPadding = PaddingValues(16.dp, 8.dp, 16.dp, LIST_BOTTOM),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        itemsIndexed(ordered, key = { _, t -> t.id }) { index, t ->
+        itemsIndexed(orderedOpen, key = { _, t -> t.id }) { _, t ->
             val isDragging = dragId == t.id
-            SwipeRow(
-                actions = listOf("完成" to Green, "删除" to Accent),
-                onAction = { i -> if (i == 0) onDoneWithUndo(t) else onDeleteWithUndo(t) },
-                enabled = false,
+            TodoRow(
+                t = t,
+                onToggleTodo = onToggleTodo, onOpenDetail = onOpenDetail,
+                onDeleteWithUndo = onDeleteWithUndo,
+                onMeasured = { h ->
+                    if (dragId != t.id && h > 0) rowPx = h + with(density) { 8.dp.toPx() }
+                },
+                dragModifier = Modifier.pointerInput(t.id, openOrder.size) {
+                    detectDragGesturesAfterLongPress(
+                        onDragStart = { onDragStart(t.id) },
+                        onDrag = { change, amount -> change.consume(); onDragBy(amount.y) },
+                        onDragEnd = { onDragFinish() },
+                        onDragCancel = { onDragFinish() }
+                    )
+                },
                 modifier = Modifier
-                    // 位置动画只在拖动排序时开：切天时"过往未完成/无期限/每日固定"这些条目的 key
-                    // 跨天是一样的、只是顺序变了，位置动画会把它们从旧位置动到新位置 →
-                    // 看起来就是"条目先窜到顶格、再回落"。平时一律关掉。
+                    // 位置动画：让「让位」的那几条平滑滑到新位置。
+                    // 被拖起的那条**必须关掉** —— 它的位置由手指的 translationY 直接控制，
+                    // 再叠一层弹簧动画会两边打架、视觉上就是「画面突然闪一下」。
+                    // （原来是反的：拖动条开动画、让位条关动画，正好写颠倒了。）
+                    // 平时（非拖动）也一律关：切天时「过往未完成/无期限/每日固定」的 key
+                    // 跨天不变、只是顺序变了，位置动画会把它们从旧位置动到新位置 →
+                    // 看起来就是「条目先窜到顶格、再回落」。
                     .animateItem(
                         fadeInSpec = null,
-                        placementSpec = if (isDragging) spring(stiffness = Spring.StiffnessMediumLow) else null,
+                        placementSpec = if (dragId != null && !isDragging) spring(stiffness = Spring.StiffnessMediumLow) else null,
                         fadeOutSpec = null
                     )
                     .zIndex(if (isDragging) 2f else 0f)
-                    .graphicsLayer { translationY = if (isDragging) dragDy else 0f }
-            ) {
-                TodoCard(
-                    t = t,
-                    onToggle = onToggle,
-                    onLongPress = onLongPress,
-                    showHandle = true,
-                    reorderHandleModifier = Modifier.pointerInput(t.id, localOrder) {
-                        detectDragGesturesAfterLongPress(
-                            onDragStart = { onDragStart(t.id) },
-                            onDrag = { change, amount -> change.consume(); onDragBy(amount.y) },
-                            onDragEnd = { onDragFinish() },
-                            onDragCancel = { onDragFinish() }
-                        )
+                    // 拖起时放大 2% + 加投影（抬起来的反馈），其余卡片靠弹簧动画让位
+                    .graphicsLayer {
+                        translationY = if (isDragging) dragDy else 0f
+                        val sc = if (isDragging) 1.02f else 1f
+                        scaleX = sc; scaleY = sc
                     }
-                )
-            }
+            )
         }
         if (dayLoops.isNotEmpty()) {
-            item {
+            item(key = "loopHead") {
                 Text("每日固定", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 10.dp, bottom = 2.dp))
             }
@@ -874,37 +927,117 @@ private fun DayTodoList(
             }
         }
         if (overdueTodos.isNotEmpty()) {
-            item {
-                Text("过往未完成", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 12.dp, bottom = 2.dp))
+            item(key = "overdueHead") {
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clickable { overdueExpanded = !overdueExpanded }
+                        .padding(top = 12.dp, bottom = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("过往未完成 (${overdueTodos.size})", fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.weight(1f))
+                    Text(if (overdueExpanded) "收起 ▴" else "展开 ▾", fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
-            items(overdueTodos, key = { it.id }) { t ->
-                SwipeRow(
-                    actions = listOf("完成" to Green, "删除" to Accent),
-                    onAction = { i -> if (i == 0) onDoneWithUndo(t) else onDeleteWithUndo(t) },
-                    enabled = false,
-                    modifier = Modifier.animateItem(
-                        fadeInSpec = null, placementSpec = null, fadeOutSpec = null
+            if (overdueExpanded) {
+                items(overdueTodos, key = { "over-" + it.id }) { t ->
+                    TodoRow(
+                        t = t,
+                        onToggleTodo = onToggleTodo, onOpenDetail = onOpenDetail,
+                        onDeleteWithUndo = onDeleteWithUndo, onMeasured = {},
+                        modifier = Modifier.animateItem(
+                            fadeInSpec = null, placementSpec = null, fadeOutSpec = null
+                        )
                     )
-                ) { TodoCard(t, onToggle, onLongPress, Modifier) }
+                }
             }
         }
         if (noDueTodos.isNotEmpty()) {
-            item {
+            item(key = "noDueHead") {
                 Text("无期限", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 12.dp, bottom = 2.dp))
             }
-            items(noDueTodos, key = { it.id }) { t ->
-                SwipeRow(
-                    actions = listOf("完成" to Green, "删除" to Accent),
-                    onAction = { i -> if (i == 0) onDoneWithUndo(t) else onDeleteWithUndo(t) },
-                    enabled = false,
+            items(noDueTodos, key = { "nodue-" + it.id }) { t ->
+                TodoRow(
+                    t = t,
+                    onToggleTodo = onToggleTodo, onOpenDetail = onOpenDetail,
+                    onDeleteWithUndo = onDeleteWithUndo, onMeasured = {},
                     modifier = Modifier.animateItem(
                         fadeInSpec = null, placementSpec = null, fadeOutSpec = null
                     )
-                ) { TodoCard(t, onToggle, onLongPress, Modifier) }
+                )
             }
         }
+        // 已完成：沉到列表最下方，默认折叠成一行
+        if (dayDone.isNotEmpty()) {
+            item(key = "doneHead") {
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clickable { doneExpanded = !doneExpanded }
+                        .padding(top = 12.dp, bottom = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("已完成 (${dayDone.size})", fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.weight(1f))
+                    Text(if (doneExpanded) "收起 ▴" else "展开 ▾", fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            if (doneExpanded) {
+                items(dayDone, key = { "done-" + it.id }) { t ->
+                    TodoRow(
+                        t = t,
+                        onToggleTodo = onToggleTodo, onOpenDetail = onOpenDetail,
+                        onDeleteWithUndo = onDeleteWithUndo, onMeasured = {},
+                        restore = onRestoreTodo,
+                        modifier = Modifier.animateItem(
+                            fadeInSpec = null, placementSpec = null, fadeOutSpec = null
+                        )
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 一条待办（列表行 + 左右滑操作）。
+ *
+ * [restore] 非空 = 这条在「已完成」分区里：左滑第一下是「取消完成」，
+ * 勾选框取消勾选时走整条还原（连完成时刻一起还原，否则刚取消的又会被顶到分区最前面）。
+ */
+@Composable
+private fun TodoRow(
+    t: Todo, onToggleTodo: (Todo, Boolean) -> Unit, onOpenDetail: (Todo) -> Unit,
+    onDeleteWithUndo: (Todo) -> Unit, onMeasured: (Int) -> Unit,
+    restore: ((Todo) -> Unit)? = null,
+    modifier: Modifier = Modifier, dragModifier: Modifier = Modifier
+) {
+    SwipeRow(
+        // 已完成分区里的行，左滑第一下是「取消完成」（原来只有「完成」，点了没意义）
+        actions = if (restore != null) listOf("取消完成" to Color(0xFF8E8E93), "删除" to Accent)
+        else listOf("完成" to Green, "删除" to Accent),
+        onAction = { i ->
+            if (i == 0) { if (restore != null) restore(t) else onToggleTodo(t, true) }
+            else onDeleteWithUndo(t)
+        },
+        enabled = false,
+        modifier = modifier
+    ) {
+        TodoCard(
+            t = t,
+            onToggle = { done ->
+                // 取消已完成 → 走「带撤回的还原」；其余（勾上、未完成区取消）直接写库
+                if (!done && restore != null) restore(t) else onToggleTodo(t, done)
+            },
+            onOpenDetail = onOpenDetail,
+            showHandle = restore == null,
+            reorderHandleModifier = dragModifier,
+            measureModifier = Modifier.onGloballyPositioned { onMeasured(it.size.height) }
+        )
     }
 }
 
@@ -915,13 +1048,16 @@ private fun LoopTodoCard(loop: LoopTodo, onToggle: (Long, Boolean) -> Unit) {
             .glassSurface(shape, dark = isDarkTheme, elevation = 5.dp, strokeInset = 2.dp),
         colors = CardDefaults.cardColors(containerColor = Color.Transparent),
         shape = shape) {
-        Row(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(checked = loop.doneThisWeek, onCheckedChange = { onToggle(loop.id, it) })
+        Row(Modifier.heightIn(min = LIST_ROW_MIN_HEIGHT).padding(horizontal = 14.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+            CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 34.dp) {
+                Checkbox(checked = loop.doneThisWeek, onCheckedChange = { onToggle(loop.id, it) })
+            }
             Column(Modifier.weight(1f)) {
-                Text(loop.title, fontSize = 15.sp,
+                Text(loop.title, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     color = if (loop.doneThisWeek) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
                     textDecoration = if (loop.doneThisWeek) TextDecoration.LineThrough else null)
                 Text("循环 · ${DateUtils.WEEK_CN[loop.dayOfWeek - 1]}", fontSize = 12.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Text("🔁", fontSize = 14.sp)
@@ -929,64 +1065,94 @@ private fun LoopTodoCard(loop: LoopTodo, onToggle: (Long, Boolean) -> Unit) {
     }
 }
 
+/**
+ * 一条待办卡片。
+ *
+ * [showHandle] 拖动把手只在「未完成」分区出现（已完成分区不给把手，不给拖动）。
+ * [measureModifier] 让外层量到这张卡的真实高度，拖动换位阈值按它算（写死会导致越拖越偏）。
+ */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TodoCard(
-    t: Todo, onToggle: (Long, Boolean) -> Unit, onLongPress: (Todo) -> Unit,
-    reorderHandleModifier: Modifier = Modifier, showHandle: Boolean = false
+    t: Todo, onToggle: (Boolean) -> Unit, onOpenDetail: (Todo) -> Unit,
+    reorderHandleModifier: Modifier = Modifier, showHandle: Boolean = false,
+    measureModifier: Modifier = Modifier
 ) {
     val shape = RoundedCornerShape(18.dp)
     val dark = isDarkTheme
     val cardPress = remember { MutableInteractionSource() }
     Card(modifier = Modifier.fillMaxWidth()
             .glassSurface(shape, dark = isDarkTheme, elevation = 5.dp, strokeInset = 2.dp)
-            .pressScale(cardPress, pressed = 0.97f),
+            .pressScale(cardPress, pressed = 0.97f)
+            .then(measureModifier),
         colors = CardDefaults.cardColors(containerColor = Color.Transparent),
         shape = shape) {
-        Row(Modifier.padding(horizontal = 10.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.heightIn(min = LIST_ROW_MIN_HEIGHT).padding(horizontal = 8.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
             if (showHandle) {
-                // 拖动把手：单独吃掉长按手势，避免和卡片"长按弹菜单"同时触发
-                Box(reorderHandleModifier.size(width = 22.dp, height = 44.dp), contentAlignment = Alignment.Center) {
-                    Text("≡", fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+                // 拖动把手：单独吃掉长按手势，不打扰卡片点击。
+                // 触摸区 24×36dp（够大好拖），**不画底色** —— 那层极淡灰底用户说很丑已去掉。
+                // 宽度 26→24dp 是为了把勾选框整体左移、给标题腾地方（用户 2026-10-15 要求）。
+                Box(
+                    reorderHandleModifier.size(width = 24.dp, height = 36.dp),
+                    contentAlignment = Alignment.Center
+                ) { Text("≡", fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
-            // 其余区域：长按弹「取消 / 修改 / 删除」
+            // 其余区域：点击打开详情（标题一行放不下时截断，完整内容在弹窗里看）
             Row(
-                Modifier.weight(1f).combinedClickable(
-                    interactionSource = cardPress, indication = null,
-                    onClick = {}, onLongClick = { onLongPress(t) }
-                ),
+                Modifier.weight(1f).clickable(
+                    interactionSource = cardPress, indication = null
+                ) { onOpenDetail(t) },
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 val pc = priorityColor(t.priority, dark)
-                Box(Modifier.width(3.dp).height(30.dp).clip(RoundedCornerShape(2.dp)).background(pc))
-                Spacer(Modifier.width(8.dp))
-                Checkbox(checked = t.done, onCheckedChange = { onToggle(t.id, it) })
+                Box(Modifier.width(3.dp).height(22.dp).clip(RoundedCornerShape(2.dp)).background(pc))
+                // 勾选框整体左移、占宽收窄：色条↔勾选框间距 8→4dp，勾选框交互区 34→30dp。
+                // 两项合计给标题多腾出约 12dp（15sp 下一个汉字约 15dp，接近一个字）。
+                // Checkbox 的方块（20dp）在交互区里居中，所以交互区变小 → 方块也自动往左挪。
+                Spacer(Modifier.width(4.dp))
+                CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 30.dp) {
+                    Checkbox(checked = t.done, onCheckedChange = { onToggle(it) })
+                }
                 Column(Modifier.weight(1f)) {
-                    Text(t.title, fontSize = 15.sp,
+                    Text(t.title, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
                         color = if (t.done) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
                         textDecoration = if (t.done) TextDecoration.LineThrough else null)
+                    // 列表条目只显示备注与优先级，**绝不显示日期**。
+                    // 用户明确要求过多次：条目本来就按天分区展示，日期是冗余信息；
+                    // 未来日期的待办一旦带上日期，看起来就像"给条目加了时间"（被批评过）。
                     val sub = buildList {
                         if (t.detail.isNotBlank()) add(t.detail)
                         if (priorityLabel(t.priority).isNotBlank()) add("${priorityLabel(t.priority)}优先")
-                        if (t.dueDate != 0L && !DateUtils.isToday(DateUtils.calFrom(t.dueDate))) add(DateUtils.formatDateCn(t.dueDate))
                     }.joinToString(" · ")
-                    if (sub.isNotBlank()) Text(sub, fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (sub.isNotBlank()) {
+                        Text(sub, fontSize = 11.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
         }
     }
 }
 
-/** 新增 / 修改待办（editing == null 表示新增） */
+/**
+ * 新增 / 修改待办（editing == null 表示新增）。
+ *
+ * 自己不落库、也不弹提示条：只把结果交给 [onSave]，由调用方在**页面的**作用域里执行。
+ * 弹窗这个作用域在关闭时会被取消，落库写在这里会丢（见调用处的说明）。
+ */
 @Composable
 private fun TodoEditDialog(
-    vm: TodoViewModel, editing: Todo?, defaultDueMs: Long = 0L,
-    onSaved: (dueMs: Long, title: String) -> Unit = { _, _ -> }, onDismiss: () -> Unit
+    editing: Todo?, defaultDueMs: Long = 0L,
+    onSave: (title: String, detail: String, dueMs: Long, priority: Int) -> Unit,
+    onDismiss: () -> Unit
 ) {
     val key = editing?.id
-    var title by remember(key) { mutableStateOf(editing?.title ?: "") }
-    var detail by remember(key) { mutableStateOf(editing?.detail ?: "") }
+    // 输入框用 TextFieldValue 而不是纯 String：这样才能把光标位置设到末尾，
+    // 长备注获得焦点时视图跟着滚到最后（用户要的「点进去直接看到末尾」）。
+    var titleV by remember(key) { mutableStateOf(TextFieldValue(editing?.title ?: "")) }
+    var detailV by remember(key) { mutableStateOf(TextFieldValue(editing?.detail ?: "")) }
+    val title = titleV.text
+    val detail = detailV.text
     // 备注默认收起（用户很少填）：已有备注时自动展开，否则点「＋ 备注」才出现
     var showDetail by remember(key) { mutableStateOf(!(editing?.detail ?: "").isBlank()) }
     var priority by remember(key) { mutableIntStateOf(editing?.priority ?: PRIORITY_NONE) }
@@ -994,6 +1160,28 @@ private fun TodoEditDialog(
         mutableLongStateOf(editing?.dueDate?.takeIf { it != 0L } ?: defaultDueMs)
     }
     val dueCal = remember(dueMs) { DateUtils.calFrom(dueMs) }
+
+    /**
+     * 点输入框 → 光标和视图一起落到整条文本最后。
+     *
+     * 两个坑：
+     *  1. 不能在 onFocusChanged 里直接改 —— 点击时 TextField 自己会把光标放到**手指点的位置**，
+     *     那一手在焦点回调之后，直接改会被覆盖。
+     *  2. 只用「获得焦点」当触发不够 —— 输入框已经处于聚焦状态时再点一下不会触发焦点变化，
+     *     光标就停在手指点的位置（实测：先点一下、再点中间，字会插在中间）。
+     * 所以改成监听 InteractionSource 的「按下抬起」，每次点击都延一帧后强制设到末尾。
+     */
+    fun toEnd(v: TextFieldValue) = v.copy(selection = TextRange(v.text.length))
+
+    // 光标定位走 jumpCursorToEnd（定义在 CursorEnd.kt）：
+    // 它挂在 Final 通道上，确定性地在 TextField 自己那次定位之后生效，不靠"延两帧"赌时序
+    // —— 原来那版在模拟器上通过、在真机上失效（用户反馈"点了还是没跳过去"）。
+    // 顺便保留原有的自动聚焦：弹窗一打开就把光标放到末尾，接着就能改。
+    LaunchedEffect(key) {
+        withFrameNanos { }
+        withFrameNanos { }
+        titleV = toEnd(titleV)
+    }
 
     AlertDialog(
             shape = GlassDialogShape,
@@ -1003,16 +1191,22 @@ private fun TodoEditDialog(
         title = { Text(if (editing == null) "新增待办" else "修改待办", fontWeight = FontWeight.Bold) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("项目") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = titleV, onValueChange = { titleV = it }, label = { Text("项目") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().jumpCursorToEnd({ titleV }) { titleV = it })
                 if (showDetail) {
-                    OutlinedTextField(value = detail, onValueChange = { detail = it },
-                        label = { Text("备注（可选）") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-                        trailingIcon = {
-                            Text("收起", fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.clickable { showDetail = false })
-                        })
+                    OutlinedTextField(value = detailV, onValueChange = { detailV = it },
+                        label = { Text("备注（可选）") }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth().jumpCursorToEnd({ detailV }) { detailV = it })
+                    // 备注区收尾：一条 1px 分隔线 + 线下方右侧的「收起」
+                    //（原来「收起」嵌在输入框右边，和内容挤在一起，看不清是哪一层）
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        Text("收起 ▴", fontSize = 12.5.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.clickable { showDetail = false }
+                                .padding(horizontal = 6.dp, vertical = 4.dp))
+                    }
                 } else {
                     TextButton(onClick = { showDetail = true }, contentPadding = PaddingValues(0.dp)) {
                         Text("＋ 备注", fontSize = 13.sp)
@@ -1056,9 +1250,7 @@ private fun TodoEditDialog(
             Button(
                 onClick = {
                     if (title.isNotBlank()) {
-                        if (editing == null) vm.add(title, detail, dueMs, priority)
-                        else vm.update(editing.id, title, detail, dueMs, priority)
-                        onSaved(dueMs, title)
+                        onSave(title.trim(), detail.trim(), dueMs, priority)
                         onDismiss()
                     }
                 },

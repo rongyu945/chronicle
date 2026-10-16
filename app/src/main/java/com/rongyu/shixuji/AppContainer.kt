@@ -38,6 +38,23 @@ object AppContainer {
         }
     }
 
+    // v4 -> v5: todos 加 doneAt（完成时刻，已完成分区按它倒序排）
+    // 回填：老库里已勾掉的条目用截止日/创建时刻兜底，只是决定它们在「已完成」区里的先后
+    private val MIGRATION_4_5 = object : Migration(4, 5) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE todos ADD COLUMN doneAt INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("UPDATE todos SET doneAt = CASE WHEN dueDate != 0 THEN dueDate ELSE createdAt END WHERE done = 1")
+        }
+    }
+
+    // v5 -> v6: 删除「模型看板」整块功能（用户 2026-10-15 要求彻底删掉界面与设置里的联动）
+    // 只丢这一张表；待办/账目/标签/偏好/常用记账一律不动。
+    private val MIGRATION_5_6 = object : Migration(5, 6) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("DROP TABLE IF EXISTS api_models")
+        }
+    }
+
     fun init(context: Context) {
         if (::database.isInitialized) return
         // 刻意不保留 fallbackToDestructiveMigration：漏写迁移时宁可崩溃暴露，
@@ -46,7 +63,7 @@ object AppContainer {
             context.applicationContext,
             AppDatabase::class.java,
             "shixuji.db"
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
             .build()
     }
 }

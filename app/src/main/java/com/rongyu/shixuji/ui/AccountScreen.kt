@@ -12,7 +12,6 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -28,8 +27,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.material3.*
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -40,9 +41,12 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.font.FontWeight
 import com.rongyu.shixuji.theme.isDarkTheme
 import androidx.compose.ui.text.input.KeyboardType
@@ -66,6 +70,8 @@ import kotlinx.coroutines.launch
 import java.util.Calendar
 
 private val FAB_BOTTOM = 92.dp
+/** 「今」按钮：「＋」上方 64dp（原来 54dp 太近容易误触；改到 72dp 又太散，取中间） */
+private val FAB_TODAY_OFFSET = 56.dp
 private val LIST_BOTTOM = 180.dp
 
 class AccountViewModel : ViewModel() {
@@ -89,9 +95,37 @@ class AccountViewModel : ViewModel() {
 
     fun delete(id: Long) = viewModelScope.launch(Dispatchers.IO) { dao.delete(id) }
 
-    /** 撤销删除：按原 id 插回 */
+    /** 撤销删除：按原 id 插回（upsert：万一 id 已被新条占用也不会崩） */
     fun restore(a: Account) = viewModelScope.launch(Dispatchers.IO) {
-        dao.insert(a.copy(id = a.id))
+        dao.upsert(a.copy(id = a.id))
+    }
+
+    /**
+     * 新增并回传新条 id（提示条的「撤回」要按 id 删）。
+     * 先取 id 再插 —— 不用等 insert 返回，界面仍是「保存即关弹窗」。
+     */
+    suspend fun addReturningId(title: String, cents: Long, tag: String, isIncome: Boolean, dateMs: Long): Long {
+        val nextId = dao.nextId()
+        dao.insert(Account(id = nextId, title = title, amountCents = cents,
+            type = if (isIncome) 1 else 0, tag = tag, date = dateMs))
+        return nextId
+    }
+
+    /**
+     * 修改并回传「改之前」的完整快照（提示条的「撤回」要整条还原）。
+     * 同时也回传改之前所在日期 —— 撤回时界面要跳回那条原来的那天，否则看着像没还原。
+     */
+    suspend fun updateReturningOld(
+        id: Long, title: String, cents: Long, tag: String, isIncome: Boolean, dateMs: Long
+    ): Account? {
+        val old = dao.getById(id) ?: return null
+        dao.update(id, title, cents, if (isIncome) 1 else 0, tag, dateMs)
+        return old
+    }
+
+    /** 整条覆盖（撤回修改用，id 保留原样；upsert：那条还在库里，直插会撞主键） */
+    fun restoreFull(a: Account) = viewModelScope.launch(Dispatchers.IO) {
+        dao.upsert(a.copy(id = a.id))
     }
 
     fun update(id: Long, title: String, cents: Long, tag: String, isIncome: Boolean, dateMs: Long) =
@@ -102,23 +136,49 @@ class AccountViewModel : ViewModel() {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
+fun AccountScreen(
+    todayTick: Long = 0L,
+    vm: AccountViewModel = viewModel()
+) {
+    // 同待办：悬浮钮用**自己的**背景层（只录列表内容），不能借底栏那份（会采样到自己 → 递归崩溃）
+    val fabLayer = rememberLiquidGlassBackdrop()
     var shownDayMs by rememberSaveable { mutableLongStateOf(DateUtils.todayCal().timeInMillis) }
     val shownDay = remember(shownDayMs) { DateUtils.calFrom(shownDayMs) }
     var showAdd by remember { mutableStateOf(false) }
-    var deleteTarget by remember { mutableStateOf<Account?>(null) }
+    var detailTarget by remember { mutableStateOf<Account?>(null) }
     var editTarget by remember { mutableStateOf<Account?>(null) }
     val undo = rememberUndoController()
+    val scope = rememberCoroutineScope()
 
     val today = remember(todayTick) { DateUtils.todayCal() }
     val isThisWeek = DateUtils.isSameDay(DateUtils.startOfWeek(shownDay), DateUtils.startOfWeek(today))
 
+    // ★ 每个「显示日」一个独立的 LazyListState（普通 Map 当缓存，不是 Compose 状态）。
+    //
+    // 旧写法是「一个共享 state + 切天时 scrollToItem(0) 纠回来」：PeriodSwipe 两侧那两页
+    // 用的是各自的 state（停在第一条），滑动过程中看到的确实是新一天的开头；
+    // 可 onCommit 那一刻中心页换成共享 state，它记的还是**上一天**滚到的位置 ——
+    // 松手后先显示新一天中段的条目（分组标题「类别」还在视口上方，看着像没有类别），
+    // 过一会才被纠回顶部。按天缓存 state 后，侧页与落位后的中心页是同一个实例，
+    // 滑进来看到什么就留什么，不需要任何纠正。（离开的日子会被清掉，再翻回来仍是顶部。）
+    val dayStates = remember { mutableMapOf<Long, LazyListState>() }
+    val shownDayStartMs = DateUtils.startOfDayMs(shownDayMs)
+    fun dayListState(dayMs: Long) = dayStates.getOrPut(dayMs) { LazyListState() }
+    val listState = dayListState(shownDayStartMs)
+    LaunchedEffect(shownDayStartMs) {
+        val c = DateUtils.calFrom(shownDayStartMs)
+        val keep = (-1..1).map { DateUtils.startOfDayMs(DateUtils.addDays(c, it).timeInMillis) }.toHashSet()
+        dayStates.keys.retainAll(keep)
+    }
+
     // 大标题折叠：列表滚动时标题 28sp → 17sp，并浮出半透明标题条
-    val listState = rememberLazyListState()
     val collapsed by remember {
         derivedStateOf { listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 36 }
     }
     val collapseT by animateFloatAsState(if (collapsed) 1f else 0f, tween(200), label = "navCollapseA")
+
+    // 切天从顶部开始显示由「按天缓存 LazyListState」天然保证（见上），
+    // 不再需要 scrollToItem(0) 事后纠正 —— 那正是「先显示旧位置、过一会才刷新」的来源。
 
     val weekStart = DateUtils.startOfWeek(shownDay)
     val weekEnd = DateUtils.addDays(weekStart, 6)
@@ -138,23 +198,42 @@ fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
             .timeInMillis
     )
 
-    // 一条查询管三周（本周 ±1 周）：翻页不用重查，本周数据也在这里筛出来（省掉单独查一次本周）。
-    // 用「保留上一次结果」而不是 collectAsState(initial = 空)：翻页落定那一帧窗口刚换、
-    // 新查询还没回来时，中心页显示上一窗口的数据（仍含当前这一周），所以不会闪空。
-    val swipeFromMs = DateUtils.addDays(weekStart, -7).timeInMillis
-    val swipeToMs = DateUtils.endOfDayMs(DateUtils.addDays(weekEnd, 7).timeInMillis)
+    // 数据窗口按「月」而**不是按周**给。
+    //
+    // 原因：窗口原来是从 weekStart/weekEnd 推出来的（本周 ±1 周），于是**跨周那一刻**
+    // 窗口值变了 → `remember(swipeFromMs, swipeToMs)` 换 key → 重建 Room Flow、重跑一次
+    // SQL；用户实测"一天一天滑，只有周日滑到下周一那一下会卡"，正是这个只在跨周发生的动作。
+    //
+    // 改成按当前显示月份取，且**留足两侧余量**：列表区要 ±1 天，周条区要能看到 ±1 周
+    // （±1 周最多跨到相邻月初月末各 6 天）。所以往前后各放宽 14 天 —— 逐日滑动时月份不变
+    // → 窗口不变 → 不重查；只有跨月才换一次查询（一年 12 次 vs 原来 52 次），
+    // 且跨月只会发生在月末/月初，不会同时又是跨周边界。
+    // 用「保留上一次结果」而不是 collectAsState(initial = 空)：窗口万一刚换、新查询还没回来时，
+    // 中心页显示上一窗口的数据（仍含当前这一周），所以不会闪空。
+    val swipeFromMs = DateUtils.addDays(DateUtils.calFrom(monthStartMs), -14).timeInMillis
+    val swipeToMs = DateUtils.endOfDayMs(DateUtils.addDays(DateUtils.calFrom(monthEndMs), 14).timeInMillis)
     val swipeFlow = remember(swipeFromMs, swipeToMs) { vm.accountsBetween(swipeFromMs, swipeToMs) }
     var swipeAcc by remember { mutableStateOf<List<Account>>(emptyList()) }
     LaunchedEffect(swipeFlow) { swipeFlow.collect { swipeAcc = it } }
-    val weekAcc = swipeAcc.filter { it.date in weekStartMs..weekEndMs }
     val monthFlow = remember(monthStartMs, monthEndMs) { vm.accountsBetween(monthStartMs, monthEndMs) }
     val monthAcc by monthFlow.collectAsState(initial = emptyList())
+    // ⚠️ 这些过滤**必须 remember**（和待办页 DayTodoList 同一个坑，这里一直漏了）：
+    // 账目页在滚动/拖动时每帧都重组，不缓存的话每帧都要把 swipeAcc 整个扫几遍
+    // （weekAcc、dayAcc、day/week/month 的 sumOf，以及周条页的 pWeekAcc），
+    // 窗口现在按月算、条目更多，逐日滑动时这一笔开销每帧都付。
+    // 跨周那一刻这些过滤的输入（weekStartMs 等）全变，正好是最重的一帧。
+    val weekAcc = remember(swipeAcc, weekStartMs, weekEndMs) {
+        swipeAcc.filter { it.date in weekStartMs..weekEndMs }
+    }
 
-    val dayAcc = weekAcc.filter { it.date in shownDayMs..DateUtils.endOfDayMs(shownDayMs) }
-    val dayOut = dayAcc.filter { it.type == 0 }.sumOf { it.amountCents }
-    val weekOut = weekAcc.filter { it.type == 0 }.sumOf { it.amountCents }
-    val monthOut = monthAcc.filter { it.type == 0 }.sumOf { it.amountCents }
-    val monthIn = monthAcc.filter { it.type == 1 }.sumOf { it.amountCents }
+    val dayEndMs = DateUtils.endOfDayMs(shownDayMs)
+    val dayAcc = remember(weekAcc, shownDayMs, dayEndMs) {
+        weekAcc.filter { it.date in shownDayMs..dayEndMs }
+    }
+    val dayOut = remember(dayAcc) { dayAcc.filter { it.type == 0 }.sumOf { it.amountCents } }
+    val weekOut = remember(weekAcc) { weekAcc.filter { it.type == 0 }.sumOf { it.amountCents } }
+    val monthOut = remember(monthAcc) { monthAcc.filter { it.type == 0 }.sumOf { it.amountCents } }
+    val monthIn = remember(monthAcc) { monthAcc.filter { it.type == 1 }.sumOf { it.amountCents } }
 
     val tagList by vm.tags.collectAsState(initial = emptyList())
     val tagColorMap = remember(tagList) { tagList.associate { it.name to Color(it.color.toInt()) } }
@@ -164,7 +243,7 @@ fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
     LaunchedEffect(Unit) { budgetCents = vm.budgetCents() }
 
     Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().recordBackdrop(fabLayer)) {
             Row(
                 Modifier.fillMaxWidth()
                     .background(Color.Transparent)
@@ -196,8 +275,14 @@ fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
                             Modifier.glassSurface(RoundedCornerShape(20.dp), dark = isDarkTheme, elevation = 3.dp)
                                 .clickable {
                                     val now = DateUtils.atCurrentTime(DateUtils.todayCal())
+                                    // 新增不再弹撤回提示条（用户 2026-10-12：只保留删除的撤回）
                                     vm.add(q.title, q.amountCents, q.tag, q.type == 1, now)
-                                    undo.show("已记一笔：${q.title} ${formatCents(q.amountCents)}") { /* 手动删除即可 */ }
+                                    // 快捷记账固定记在「今天」：当前若看着别的日期就跳过去，
+                                    // 否则记完在当前页看不到这笔（像没记上）
+                                    shownDayMs = DateUtils.startOfDayMs(now)
+                                    // 不再在这里 scrollToItem(0)：那是和写库并行的协程，会抢在
+                                    // 数据到达之前滚，反而把列表锚在原位（详见列表区那段注释）。
+                                    // 回顶统一由「当天数据变化」那个 LaunchedEffect 负责。
                                 }
                                 .padding(horizontal = 13.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically
@@ -236,15 +321,16 @@ fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
                     val pageWeekStart = DateUtils.startOfWeek(pageDay)
                     val pStartMs = pageWeekStart.timeInMillis
                     val pEndMs = DateUtils.endOfDayMs(DateUtils.addDays(pageWeekStart, 6).timeInMillis)
-                    val pWeekAcc = swipeAcc.filter { it.date in pStartMs..pEndMs }
-                    // 从周日切到下周一 = 跨周，整条周条 7 格同时换 → 硬切会"卡一下"，
-                    // 按「周」做一次快速淡换解决
-                    val accWeekKey = remember(pageDay) { DateUtils.startOfWeek(pageDay).timeInMillis }
-                    Crossfade(targetState = accWeekKey, animationSpec = tween(150), label = "accWeekFade") {
-                        AccountWeekStrip(pageDay, today, pWeekAcc,
-                            onSelectDay = { shownDayMs = it.timeInMillis },
-                            dragFrac = { dayFrac.floatValue })
+                    val pWeekAcc = remember(swipeAcc, pStartMs, pEndMs) {
+                        swipeAcc.filter { it.date in pStartMs..pEndMs }
                     }
+                    // 跨周时整条周条的 7 格会同时换掉。原来这里套了一层 Crossfade(150ms)，
+                    // 以为"淡换比硬切顺"——实际相反：Crossfade 只在跨周时命中，把整条周条
+                    // **同时合成两份**（新旧各一份）并各建离屏图层，实测跨周最差帧 ≈1095ms
+                    //（周内 ≈323ms）。去掉后只是数字瞬换一下，反而没有"卡一下"了。
+                    AccountWeekStrip(pageDay, today, pWeekAcc,
+                        onSelectDay = { shownDayMs = it.timeInMillis },
+                        dragFrac = { dayFrac.floatValue })
                 }
                 Spacer(Modifier.height(2.dp))
                 // —— 账目列表区：左右滑动切换一天 ——
@@ -257,12 +343,44 @@ fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
                         shownDayMs = DateUtils.addDays(DateUtils.calFrom(shownDayMs), dir).timeInMillis
                     }
                 ) { off ->
-                    val slotState = if (off == 0) listState else remember(off) { LazyListState() }
                     val pageDay = remember(shownDayMs, off) {
                         DateUtils.addDays(DateUtils.calFrom(shownDayMs), off)
                     }
                     val pageDayMs = pageDay.timeInMillis
-                    val pDayAcc = swipeAcc.filter { it.date in pageDayMs..DateUtils.endOfDayMs(pageDayMs) }
+                    // 按「这一天」取 state：中心页和侧页是同一个实例 → 滑进来看到什么就留什么
+                    val slotState = dayListState(DateUtils.startOfDayMs(pageDayMs))
+                    // 必须 remember：PeriodSwipe 同时画三页，不缓存的话每帧过滤三遍
+                    val pDayAcc = remember(swipeAcc, pageDayMs) {
+                        swipeAcc.filter { it.date in pageDayMs..DateUtils.endOfDayMs(pageDayMs) }
+                    }
+                    // 分组 + 排序同样要 remember：按标签分组要排序+建 Map，条目多时每帧都在算
+                    // （三页 = 每帧三遍）。注意只能在 @Composable 上下文里 remember，
+                    // 不能写进 LazyColumn 的 content lambda（那是 LazyListScope，不参与重组）。
+                    val grouped = remember(pDayAcc) {
+                        pDayAcc.sortedByDescending { it.date }.groupBy { it.tag }
+                    }
+
+                    // 侧页（不是当前显示日）只要它那天变了就先归零：跟着手指滑进来的那一页
+                    // 永远从第一条开始，落位后中心页用的就是这个 state，松手瞬间不会跳。
+                    LaunchedEffect(off, pageDayMs) {
+                        if (off != 0) slotState.scrollToItem(0)
+                    }
+                    // ★ 回顶要「等数据真的变了」再滚，而且只能有一个触发源。
+                    //
+                    // 旧写法是保存时 `scope.launch { listState.scrollToItem(0) }` —— 它和
+                    // 写库是**两条并行协程**：滚动常常先执行，那时列表里还没有新条目；
+                    // 等 Room 的 Flow 把新数据推过来，LazyColumn 会按 key 把「原先可见那一条」
+                    // 锚在原位，新条目被插到它**上面**、看不见 —— 观感就是没回到第一条。
+                    // 你当时是停在底部就"直接到底"、停在中间就"卡在半路"，正是这个锚定行为。
+                    //
+                    // 现在改成挂在**当天数据**上：只要这一天的条目集合变了（新增/删除/改日期），
+                    // 就重新滚到第一条。数据没变时（用户只是自己在读）绝不乱跳。
+                    // 侧页（off≠0）不滚，避免和中心页抢同一个 state。
+                    // 用 animateScrollToItem（平滑动画）而不是瞬移的 requestScrollToItem ——
+                    // 与待办页同一口径（用户 2026-10-14：从列表尾部瞬移到头部「跳起来很难看」）。
+                    LaunchedEffect(off, pageDayMs, pDayAcc.size, pDayAcc.firstOrNull()?.id) {
+                        if (off == 0) slotState.animateScrollToItem(0)
+                    }
 
                     Column(Modifier.fillMaxSize()) {
 
@@ -271,12 +389,11 @@ fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
                         state = slotState,
                         modifier = Modifier.weight(1f),
                         contentPadding = PaddingValues(16.dp, 8.dp, 16.dp, LIST_BOTTOM),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
                         if (pDayAcc.isEmpty()) {
                             // 空列表不再写提示字（右下角 ＋ 就在旁边）
                         } else {
-                            val grouped = pDayAcc.sortedByDescending { it.date }.groupBy { it.tag }
                             grouped.forEach { (tag, list) ->
                                 val tagColor = tagColorMap[tag] ?: Color(0xFFC7C7CC)
                                 if (tag.isNotBlank()) {
@@ -304,7 +421,7 @@ fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
                                     ) {
                                         AccountRow(
                                             acc = acc, tagColor = tagColor,
-                                            onLongPress = { deleteTarget = acc }
+                                            onOpenDetail = { detailTarget = acc }
                                         )
                                     }
                                 }
@@ -316,18 +433,17 @@ fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
                 }
             }
 
-        // 同待办：实心圆，不用 FAB（避免阴影叠出多边形亮边）+ 按压反馈
-        val addPress = remember { MutableInteractionSource() }
-        Box(
-            Modifier.align(Alignment.BottomEnd)
-                .padding(20.dp).padding(bottom = FAB_BOTTOM).size(44.dp)
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.primary)
-                .clickable(interactionSource = addPress, indication = null, role = Role.Button) { showAdd = true }
-                .pressScale(addPress)
-                .semantics { contentDescription = "记一笔" },
-            contentAlignment = Alignment.Center
-        ) { Text("+", fontSize = 22.sp, color = Color.White) }
+        // 同待办：磨砂玻璃圆（和底栏同一套液态玻璃），不用 FAB（避免阴影叠出多边形亮边）
+        GlassCircleButton(
+            label = "+",
+            tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.62f),
+            fallbackColor = MaterialTheme.colorScheme.primary,
+            labelColor = Color.White,
+            contentDescription = "记一笔",
+            onClick = { showAdd = true },
+            backdrop = fabLayer,
+            modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp).padding(bottom = FAB_BOTTOM)
+        )
 
         // “今”按钮：不在今天时出现，一键回今天（和待办页一致）
         AnimatedVisibility(
@@ -337,57 +453,93 @@ fun AccountScreen(todayTick: Long = 0L, vm: AccountViewModel = viewModel()) {
             modifier = Modifier.align(Alignment.BottomEnd)
         ) {
             val dark = isDarkTheme
-            val todayPress = remember { MutableInteractionSource() }
-            Box(
-                Modifier
-                    .padding(20.dp).padding(bottom = FAB_BOTTOM + 54.dp).size(44.dp)
-                    .clip(CircleShape)
-                    .background(if (dark) Color(0xFF3A3A3C) else Color.White)
-                    .border(0.8.dp, if (dark) Color.White.copy(alpha = 0.18f) else Color(0xFFE5E5EA), CircleShape)
-                    .clickable(interactionSource = todayPress, indication = null, role = Role.Button) {
-                        shownDayMs = today.timeInMillis
-                    }
-                    .pressScale(todayPress)
-                    .semantics { contentDescription = "回到今天" },
-                contentAlignment = Alignment.Center
-            ) { Text("今", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
+            GlassCircleButton(
+                label = "今",
+                tint = if (dark) Color.White.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.34f),
+                fallbackColor = if (dark) Color(0xFF3A3A3C) else Color.White,
+                labelColor = MaterialTheme.colorScheme.primary,
+                labelSize = 14.sp, labelBold = true,
+                contentDescription = "回到今天",
+                onClick = { shownDayMs = today.timeInMillis },
+                backdrop = fabLayer,
+                modifier = Modifier.padding(20.dp).padding(bottom = FAB_BOTTOM + FAB_TODAY_OFFSET)
+            )
         }
 
+        // 提示条位置和待办页保持一致（记账页底部没有摘要条，132dp 就是干净的空档）
         UndoHost(undo, Modifier.align(Alignment.BottomCenter).padding(bottom = 132.dp))
     }
 
     if (showAdd) {
         AccountEditSheet(
-            vm = vm, tags = tagList, editing = null,
+            tags = tagList, editing = null,
             defaultDateMs = DateUtils.atCurrentTime(shownDay),
+            onSave = { t, cents, tag, isIncome, dateMs ->
+                // 新增不再弹撤回提示条（用户 2026-10-12：只保留删除的撤回），直接落库即可
+                vm.add(t, cents, tag, isIncome, dateMs)
+                // 记完一笔要「跳到这一笔所在的那天」——记的是别的日期时，不跳过去当前这天
+                // 就看不到它，像没记上。日期相同则赋值是无操作，页面原地不动。
+                shownDayMs = DateUtils.startOfDayMs(dateMs)
+            },
             onDismiss = { showAdd = false }
         )
     }
 
     editTarget?.let { acc ->
         AccountEditSheet(
-            vm = vm, tags = tagList, editing = acc,
+            tags = tagList, editing = acc,
             defaultDateMs = acc.date,
+            onSave = { t, cents, tag, isIncome, dateMs ->
+                scope.launch {
+                    val old = vm.updateReturningOld(acc.id, t, cents, tag, isIncome, dateMs)
+                    if (old != null) {
+                        undo.show("已保存：${if (t.isBlank()) formatCents(cents) else t}") {
+                            vm.restoreFull(old)
+                            // 撤回修改：整条还原 + 跳回它原来所在的那一天（不然看着像没还原）
+                            shownDayMs = DateUtils.startOfDayMs(old.date)
+                        }
+                    }
+                }
+                // 改完也一样：跳到改后的日期（改到别的日期时当前页就看不到它了）；
+                // 回顶同样交给「当天数据变化」统一处理。
+                shownDayMs = DateUtils.startOfDayMs(dateMs)
+            },
             onDismiss = { editTarget = null }
         )
     }
 
-    deleteTarget?.let { acc ->
+    // 点击/长按条目 → 详情弹窗：完整显示备注、金额、标签、时间，可直接修改/删除
+    detailTarget?.let { acc ->
         AlertDialog(
             shape = GlassDialogShape,
             containerColor = glassDialogContainer(),
             modifier = glassDialogModifier(),
-            onDismissRequest = { deleteTarget = null },
-            title = { Text("这笔账目", fontWeight = FontWeight.Bold) },
-            text = { Text("「${accountTitle(acc)}」 ${formatCents(if (acc.type == 1) acc.amountCents else -acc.amountCents)}") },
+            onDismissRequest = { detailTarget = null },
+            title = { Text("账目详情", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Text(accountTitle(acc), fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                    Text(
+                        (if (acc.type == 1) "收入 " else "支出 ") + formatCents(acc.amountCents),
+                        fontSize = 15.sp,
+                        color = if (acc.type == 1) incomeGreen else MaterialTheme.colorScheme.onSurface
+                    )
+                    if (acc.tag.isNotBlank()) {
+                        Text("标签：${acc.tag}", fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text("时间：${DateUtils.formatDateCn(acc.date)} ${DateUtils.formatTime(acc.date)}",
+                        fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
             confirmButton = {
                 Row(horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = { deleteTarget = null }) { Text("取消") }
-                    TextButton(onClick = { editTarget = acc; deleteTarget = null }) { Text("修改") }
+                    TextButton(onClick = { detailTarget = null }) { Text("关闭") }
+                    TextButton(onClick = { editTarget = acc; detailTarget = null }) { Text("修改") }
                     TextButton(
                         onClick = {
                             vm.delete(acc.id)
-                            deleteTarget = null
+                            detailTarget = null
                             undo.show("已删除：${accountTitle(acc)}") { vm.restore(acc) }
                         },
                         colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
@@ -427,7 +579,8 @@ private fun AccountHero(monthWord: String, monthOut: Long, dayOut: Long, weekOut
                 color = Color.White)
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                HeroCell("今日", formatCents(dayOut), Modifier.weight(1f))
+                // 「本日」= 正在看的那一天的支出（原写「今日」，翻到别的日期时标签与数字对不上）
+                HeroCell("本日", formatCents(dayOut), Modifier.weight(1f))
                 HeroCell("本周", formatCents(weekOut), Modifier.weight(1f))
                 HeroCell("${monthWord}收入", formatCents(monthIn), Modifier.weight(1f))
             }
@@ -493,42 +646,22 @@ private fun HeroCell(label: String, value: String, mod: Modifier) {
     }
 }
 
-/** 单条账目行（金额等宽右对齐） */
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun AccountRow(acc: Account, tagColor: Color, onLongPress: () -> Unit) {
-    val shape = RoundedCornerShape(18.dp)
-    Row(
-        Modifier.fillMaxWidth().glassSurface(shape, dark = isDarkTheme, elevation = 4.dp, strokeInset = 2.dp)
-            .combinedClickable(onClick = {}, onLongClick = onLongPress)
-            .padding(horizontal = 14.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(Modifier.size(10.dp).background(tagColor, CircleShape))
-        Column(Modifier.weight(1f).padding(start = 10.dp)) {
-            Text(accountTitle(acc), fontSize = 14.sp)
-            Text(DateUtils.formatTime(acc.date), fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Text(
-            formatCents(if (acc.type == 1) acc.amountCents else -acc.amountCents),
-            fontSize = 15.sp, fontWeight = FontWeight.Medium,
-            textAlign = TextAlign.End,
-            color = if (acc.type == 1) incomeGreen else MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.widthIn(min = 96.dp)
-        )
-    }
-}
-
 /** 记账星期条：本周7天，选中高亮，点选切换（类似待办周条） */
 @Composable
 private fun AccountWeekStrip(
     shownDay: Calendar, today: Calendar, weekAcc: List<Account>, onSelectDay: (Calendar) -> Unit,
     dragFrac: () -> Float = { 0f }
 ) {
-    val start = DateUtils.startOfWeek(shownDay)
-    val days = (0..6).map { DateUtils.addDays(start, it) }
-    val selIdx = days.indexOfFirst { DateUtils.isSameDay(it, shownDay) }.coerceAtLeast(0)
+    // remember：跨周时 7 天全变，不记住会每帧重算 7 次 Calendar 拷贝 + 7 次 endOfDayMs
+    val start = remember(shownDay) { DateUtils.startOfWeek(shownDay) }
+    val days = remember(start) { (0..6).map { DateUtils.addDays(start, it) } }
+    val selIdx = remember(days, shownDay) {
+        days.indexOfFirst { DateUtils.isSameDay(it, shownDay) }.coerceAtLeast(0)
+    }
+    // 每天是否有账目：按「天毫秒」建一次 Set，避免每格都对 weekAcc 扫一遍（7×N）
+    val dayKeysWithAcc = remember(weekAcc) {
+        weekAcc.map { DateUtils.startOfDayMs(it.date) }.toHashSet()
+    }
     val circle = 32.dp
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
         // 星期几单独一行（显式行高，红圆纵坐标才是确定的）
@@ -556,9 +689,7 @@ private fun AccountWeekStrip(
             Row(Modifier.fillMaxWidth()) {
                 days.forEachIndexed { i, d ->
                     val isToday = DateUtils.isSameDay(d, today)
-                    val dayM = d.timeInMillis
-                    val dayMd = DateUtils.endOfDayMs(dayM)
-                    val hasAcc = weekAcc.any { it.date in dayM..dayMd }
+                    val hasAcc = DateUtils.startOfDayMs(d.timeInMillis) in dayKeysWithAcc
                     Column(Modifier.weight(1f).clickable { onSelectDay(d) }, horizontalAlignment = Alignment.CenterHorizontally) {
                         Box(Modifier.size(circle).background(
                             if (isToday && i != selIdx) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)
@@ -590,15 +721,18 @@ private fun AccountWeekStrip(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AccountEditSheet(
-    vm: AccountViewModel,
     tags: List<AccTagEntity>,
     editing: Account?,
     defaultDateMs: Long,
+    onSave: (title: String, cents: Long, tag: String, isIncome: Boolean, dateMs: Long) -> Unit,
     onDismiss: () -> Unit
 ) {
     val key = editing?.id
-    var amount by remember(key) { mutableStateOf(editing?.let { centsToYuanString(it.amountCents) } ?: "") }
-    var title by remember(key) { mutableStateOf(editing?.title ?: "") }
+    // 用 TextFieldValue：获得焦点时能把光标设到末尾、视图一起滚到最后
+    var amountV by remember(key) { mutableStateOf(TextFieldValue(editing?.let { centsToYuanString(it.amountCents) } ?: "")) }
+    var titleV by remember(key) { mutableStateOf(TextFieldValue(editing?.title ?: "")) }
+    val amount = amountV.text
+    val title = titleV.text
     // 备注默认收起；已有备注自动展开
     var showNote by remember(key) { mutableStateOf(!(editing?.title ?: "").isBlank()) }
     var isIncome by remember(key) { mutableStateOf(editing?.type == 1) }
@@ -610,6 +744,22 @@ private fun AccountEditSheet(
 
     LaunchedEffect(key) { amountFocus.requestFocus() }
 
+    // 每次打开弹窗都把金额光标放到末尾（弹窗是自动聚焦的，这样一进来就能接着改）
+    LaunchedEffect(key) {
+        withFrameNanos { }
+        withFrameNanos { }
+        amountV = amountV.copy(selection = TextRange(amountV.text.length))
+    }
+
+    /**
+     * 点输入框 → 光标和视图一起落到整条文本最后。
+     *
+     * 不用"延两帧再改"那种写法：那是靠时间赌，TextField 的定位可能在更晚的帧才处理完，
+     * 结果把光标又拽回手指点的地方（模拟器上通过、真机上失效）。
+     * 现在统一走 jumpCursorToEnd（定义在 CursorEnd.kt）—— 它挂在 Final 通道，
+     * 确定性地在 TextField 那次定位之后、同一帧内生效，不依赖帧数。
+     */
+
     AlertDialog(
             shape = GlassDialogShape,
             containerColor = glassDialogContainer(),
@@ -618,24 +768,29 @@ private fun AccountEditSheet(
         title = { Text(if (editing == null) "记一笔" else "修改账目", fontWeight = FontWeight.Bold) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(value = amount, onValueChange = { amount = it; error = null },
+                OutlinedTextField(value = amountV, onValueChange = { amountV = it; error = null },
                     label = { Text("金额") }, singleLine = true,
                     isError = error != null,
                     supportingText = error?.let { { Text(it, fontSize = 11.sp) } },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth().focusRequester(amountFocus))
+                    modifier = Modifier.fillMaxWidth().focusRequester(amountFocus)
+                        .jumpCursorToEnd({ amountV }) { amountV = it })
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(selected = !isIncome, onClick = { isIncome = false }, label = { Text("支出") })
                     FilterChip(selected = isIncome, onClick = { isIncome = true }, label = { Text("收入") })
                 }
                 if (showNote) {
-                    OutlinedTextField(value = title, onValueChange = { title = it },
-                        label = { Text("备注") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-                        trailingIcon = {
-                            Text("收起", fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.clickable { showNote = false })
-                        })
+                    OutlinedTextField(value = titleV, onValueChange = { titleV = it },
+                        label = { Text("备注") }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth().jumpCursorToEnd({ titleV }) { titleV = it })
+                    // 备注区收尾：1px 分隔线 + 线下方右侧的「收起」（原来嵌在输入框里，跟内容挤在一起）
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        Text("收起 ▴", fontSize = 12.5.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.clickable { showNote = false }
+                                .padding(horizontal = 6.dp, vertical = 4.dp))
+                    }
                 } else {
                     TextButton(onClick = { showNote = true }, contentPadding = PaddingValues(0.dp)) {
                         Text("＋ 备注", fontSize = 13.sp)
@@ -681,8 +836,7 @@ private fun AccountEditSheet(
                     if (cents == null) {
                         error = "请输入有效金额（最多两位小数）"
                     } else {
-                        if (editing == null) vm.add(title.trim(), cents, tag, isIncome, dateMs)
-                        else vm.update(editing.id, title.trim(), cents, tag, isIncome, dateMs)
+                        onSave(title.trim(), cents, tag, isIncome, dateMs)
                         onDismiss()
                     }
                 },

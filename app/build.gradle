@@ -20,8 +20,8 @@ android {
         applicationId "com.rongyu.shixuji"
         minSdk 24
         targetSdk 34
-        versionCode 77
-        versionName "4.4.5"
+        versionCode 517
+        versionName "5.1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -84,6 +84,9 @@ dependencies {
 
     // Navigation
     implementation 'androidx.navigation:navigation-compose:2.8.5'
+
+    // FileProvider + ShareCompat（「分享备份」走系统分享面板）
+    implementation 'androidx.core:core-ktx:1.13.1'
 
     // 单元测试（纯逻辑：金额换算 / 日期计算）
     testImplementation 'junit:junit:4.13.2'

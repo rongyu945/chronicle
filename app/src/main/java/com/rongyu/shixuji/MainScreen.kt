@@ -31,11 +31,10 @@ import kotlinx.coroutines.launch
 enum class ShixuTab(val label: String, val iconRes: Int) {
     TODO("待办", R.drawable.ic_tab_todo),
     ACCOUNT("账目", R.drawable.ic_tab_wallet),
-    MODEL("模型", R.drawable.ic_tab_model),
     SETTINGS("设置", R.drawable.ic_tab_settings)
 }
 
-val DEFAULT_TAB_ORDER = listOf("待办", "账目", "模型", "设置")
+val DEFAULT_TAB_ORDER = listOf("待办", "账目", "设置")
 
 /** 字号档位 */
 val FONT_SCALES = listOf("小" to 0.9f, "标准" to 1.0f, "大" to 1.15f)
@@ -67,8 +66,10 @@ fun MainScreen() {
         prefDao.get("dark")?.let { isDark = when (it) { "1" -> true; "0" -> false; else -> null } }
         prefDao.get("font_scale")?.let { s -> s.toFloatOrNull()?.let { fontScale = it } }
         prefDao.get("tab_order")?.let { raw ->
+            // 历史存档里可能还带着已删除的「模型」（底栏四项 → 三项），先按当前 Tab 集合过滤再校验
             val parsed = raw.split(",").filter { it.isNotBlank() }
-            if (parsed.size == 4) tabOrder = parsed
+            val known = parsed.filter { lb -> ShixuTab.entries.any { it.label == lb } }.distinct()
+            if (known.size == ShixuTab.entries.size) tabOrder = known
         }
         // 循环待办：进入新的一周就清零，否则"每周循环"永远只生效一次
         val thisWeek = DateUtils.startOfWeek(DateUtils.todayCal()).timeInMillis.toString()
@@ -108,7 +109,7 @@ fun MainScreen() {
 
     val orderedTabs: List<ShixuTab> = remember(tabOrder) {
         val m = tabOrder.mapNotNull { label -> ShixuTab.entries.find { it.label == label } }
-        if (m.size == 4) m else ShixuTab.entries.toList()
+        if (m.size == ShixuTab.entries.size) m else ShixuTab.entries.toList()
     }
     // 默认页 = 底栏第一个（设置里可调）
     var selected by remember { mutableStateOf(orderedTabs.first()) }
@@ -125,73 +126,79 @@ fun MainScreen() {
             // 弹窗打开 → 主界面实时模糊；松手恢复。安卓 12 以下自动不生效（退化成不模糊）
             val modalOpen = GlassModalState.isOpen
             val blurPx by animateFloatAsState(if (modalOpen) 15f else 0f, tween(220), label = "glassBlur")
-            Box(
-                Modifier.fillMaxSize().then(
-                    if (blurPx > 0.4f) Modifier.blur(blurPx.dp) else Modifier
-                )
-            ) {
-                // 底层柔光色斑：玻璃卡片要有东西可透
-                ColorBlobsBackground(dark)
+            // 液态玻璃背景层：只给底栏采样用。
+            // ⚠️ 底栏必须写在挂了 recordBackdrop 的那层**外面**，否则会把自己也录进去 → 递归。
+            val backdrop = rememberLiquidGlassBackdrop()
+            Box(Modifier.fillMaxSize()) {
+                // 原来的内容层（弹窗打开时整体模糊）——只多了 .recordBackdrop()，
+                // 它只是把这里画的东西额外录一份给底栏用，不改变任何渲染结果。
+                Box(Modifier.fillMaxSize().then(
+                        if (blurPx > 0.4f) Modifier.blur(blurPx.dp) else Modifier
+                    ).recordBackdrop(backdrop)
+                ) {
+                    // 底层柔光色斑：玻璃要有东西可透
+                    ColorBlobsBackground(dark)
 
-                Scaffold(containerColor = Color.Transparent, bottomBar = {}) { innerPadding ->
-                    AnimatedContent(
-                        targetState = selected,
-                        transitionSpec = {
-                            val from = orderedTabs.indexOf(initialState)
-                            val to = orderedTabs.indexOf(targetState)
-                            val dir = if (to >= from) 1 else -1
-                            (slideInHorizontally(tween(260)) { w -> dir * w / 3 } + fadeIn(tween(200))) togetherWith
-                                (slideOutHorizontally(tween(260)) { w -> -dir * w / 3 } + fadeOut(tween(160)))
-                        },
-                        label = "tab"
-                    ) { tab ->
-                        // 用 SaveableStateHolder 保住每个 Tab 的界面状态（翻到哪一周/滚动位置等）
-                        Box(Modifier.padding(innerPadding)) {
-                            holder.SaveableStateProvider(tab.name) {
-                                when (tab) {
-                                    ShixuTab.TODO -> TodoScreen(
-                                        onOpenAccount = { selected = ShixuTab.ACCOUNT },
-                                        todayTick = todayTick
-                                    )
-                                    ShixuTab.ACCOUNT -> AccountScreen(todayTick = todayTick)
-                                    ShixuTab.MODEL -> ModelBoardScreen()
-                                    ShixuTab.SETTINGS -> SettingsScreen(
-                                        isSongti = isSongti,
-                                        isDark = isDark,
-                                        tabOrder = tabOrder,
-                                        fontScale = fontScale,
-                                        // 注意：这些设置变更互不干扰，绝不能顺手改 selected，
-                                        // 否则在设置页一动开关就会跳回第一个 Tab
-                                        onToggleSongti = { v ->
-                                            isSongti = v
-                                            scope.launch { prefDao.put(AppPref("songti", if (v) "1" else "0")) }
-                                        },
-                                        onToggleDark = { d ->
-                                            isDark = d
-                                            scope.launch { prefDao.put(AppPref("dark", when (d) { true -> "1"; false -> "0"; null -> "2" })) }
-                                        },
-                                        onSetFontScale = { s ->
-                                            fontScale = s
-                                            scope.launch { prefDao.put(AppPref("font_scale", s.toString())) }
-                                        },
-                                        onApplyOrder = { newOrder ->
-                                            tabOrder = newOrder
-                                            scope.launch { prefDao.put(AppPref("tab_order", newOrder.joinToString(","))) }
-                                            // 只有改底栏顺序时才切换默认页
-                                            selected = ShixuTab.entries.find { it.label == newOrder.first() } ?: ShixuTab.TODO
-                                        }
-                                    )
+                    Scaffold(containerColor = Color.Transparent, bottomBar = {}) { innerPadding ->
+                        AnimatedContent(
+                            targetState = selected,
+                            transitionSpec = {
+                                val from = orderedTabs.indexOf(initialState)
+                                val to = orderedTabs.indexOf(targetState)
+                                val dir = if (to >= from) 1 else -1
+                                (slideInHorizontally(tween(260)) { w -> dir * w / 3 } + fadeIn(tween(200))) togetherWith
+                                    (slideOutHorizontally(tween(260)) { w -> -dir * w / 3 } + fadeOut(tween(160)))
+                            },
+                            label = "tab"
+                        ) { tab ->
+                            // 用 SaveableStateHolder 保住每个 Tab 的界面状态（翻到哪一周/滚动位置等）
+                            Box(Modifier.padding(innerPadding)) {
+                                holder.SaveableStateProvider(tab.name) {
+                                    when (tab) {
+                                        ShixuTab.TODO -> TodoScreen(
+                                            onOpenAccount = { selected = ShixuTab.ACCOUNT },
+                                            todayTick = todayTick
+                                        )
+                                        ShixuTab.ACCOUNT -> AccountScreen(todayTick = todayTick)
+                                        ShixuTab.SETTINGS -> SettingsScreen(
+                                            isSongti = isSongti,
+                                            isDark = isDark,
+                                            tabOrder = tabOrder,
+                                            fontScale = fontScale,
+                                            // 注意：这些设置变更互不干扰，绝不能顺手改 selected，
+                                            // 否则在设置页一动开关就会跳回第一个 Tab
+                                            onToggleSongti = { v ->
+                                                isSongti = v
+                                                scope.launch { prefDao.put(AppPref("songti", if (v) "1" else "0")) }
+                                            },
+                                            onToggleDark = { d ->
+                                                isDark = d
+                                                scope.launch { prefDao.put(AppPref("dark", when (d) { true -> "1"; false -> "0"; null -> "2" })) }
+                                            },
+                                            onSetFontScale = { s ->
+                                                fontScale = s
+                                                scope.launch { prefDao.put(AppPref("font_scale", s.toString())) }
+                                            },
+                                            onApplyOrder = { newOrder ->
+                                                tabOrder = newOrder
+                                                scope.launch { prefDao.put(AppPref("tab_order", newOrder.joinToString(","))) }
+                                                // 只有改底栏顺序时才切换默认页
+                                                selected = ShixuTab.entries.find { it.label == newOrder.first() } ?: ShixuTab.TODO
+                                            }
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                // 浮起来的玻璃胶囊底栏
+                // 浮起来的玻璃胶囊底栏（在模糊层之外：图标清晰，背景被玻璃折射）
                 GlassBottomBar(
                     items = orderedTabs.map { TabItem(it.label, it.iconRes) },
                     selectedIndex = orderedTabs.indexOf(selected),
                     onSelect = { i -> selected = orderedTabs[i] },
+                    backdrop = backdrop,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .navigationBarsPadding()

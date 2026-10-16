@@ -1,5 +1,8 @@
 package com.rongyu.shixuji.ui
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -9,6 +12,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -176,9 +180,18 @@ fun SplashScreen(onEnter: () -> Unit) {
     val textColor = if (isMorning) Color(0xFF3A2E1E) else Color(0xFFE8E6E0)
     val subColor = if (isMorning) Color(0xFF8A7A5A) else Color(0xFFA0A0B0)
 
+    // 启动页进场动画：背景淡入 + 整块内容轻微上浮（300ms）。只做一次、不经手指，保证零性能影响
+    var entered by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { entered = true }
+    val alphaIn by animateFloatAsState(if (entered) 1f else 0f, tween(300), label = "splashFade")
+    val riseIn by animateFloatAsState(if (entered) 0f else 18f, tween(300, easing = LinearEasing), label = "splashRise")
+
     Box(Modifier.fillMaxSize().background(bg), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(40.dp)) {
+            modifier = Modifier.padding(40.dp).graphicsLayer {
+                alpha = alphaIn
+                translationY = riseIn
+            }) {
             Text(greeting,
                 fontFamily = songtiFamily,
                 fontSize = 44.sp, fontWeight = FontWeight.Bold, color = textColor)
