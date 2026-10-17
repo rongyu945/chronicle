@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色下的窗口底色：和 MainScreen 里「偏好读完之前」铺的那块颜色一致（0xFF0E0F12），
+         否则系统处于深色时冷启动会先闪一下浅色窗口，再跳成深色界面。 -->
+    <color name="shixuji_bg">#0E0F12</color>
+</resources>

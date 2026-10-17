@@ -49,10 +49,12 @@ import com.rongyu.shixuji.AppContainer
 import com.rongyu.shixuji.BuildConfig
 import com.rongyu.shixuji.DEFAULT_TAB_ORDER
 import com.rongyu.shixuji.FONT_SCALES
+import com.rongyu.shixuji.parseTabOrder
 import com.rongyu.shixuji.data.AccTagEntity
 import com.rongyu.shixuji.data.Account
 import com.rongyu.shixuji.data.AppDatabase
 import com.rongyu.shixuji.data.AppPref
+import com.rongyu.shixuji.data.BackupCodec
 import com.rongyu.shixuji.data.LoopTodo
 import com.rongyu.shixuji.data.QuickEntry
 import com.rongyu.shixuji.data.Todo
@@ -130,7 +132,7 @@ fun SettingsScreen(
         // 底部留白要够：底栏是浮起来的胶囊，留 16dp 会让最后一张卡（关于）被挡住
         Column(
             Modifier.weight(1f).fillMaxWidth().verticalScroll(scrollState)
-                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 150.dp),
+                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = LIST_BOTTOM_PLAIN),
             verticalArrangement = Arrangement.spacedBy(9.dp)
         ) {
 
@@ -152,7 +154,7 @@ fun SettingsScreen(
                 Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf("跟随系统" to null, "浅色" to false, "深色" to true).forEach { (label, mode) ->
-                        FilterChip(
+                        ShixuChip(
                             selected = isDark == mode,
                             onClick = { onToggleDark(mode) },
                             label = { Text(label, fontSize = 13.sp) },
@@ -165,7 +167,7 @@ fun SettingsScreen(
                 Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     FONT_SCALES.forEach { (label, scale) ->
-                        FilterChip(
+                        ShixuChip(
                             selected = kotlin.math.abs(fontScale - scale) < 0.01f,
                             onClick = { onSetFontScale(scale) },
                             label = { Text(label, fontSize = 13.sp) },
@@ -257,7 +259,7 @@ private fun ColumnScope.SettingSubPage(
         }
         Column(
             Modifier.weight(1f).fillMaxWidth().verticalScroll(subScroll)
-                .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 150.dp)
+                .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = LIST_BOTTOM_PLAIN)
         ) {
         when (page) {
             "loop" -> LoopTodoPage()
@@ -322,21 +324,24 @@ class SettingsViewModel : ViewModel() {
 
     suspend fun countByTag(name: String): Int = accountDao.countByTag(name)
 
-    /** 删标签：同时把用到它的账目标签清空，不留孤儿标签 */
+    /** 删标签：同时把用到它的账目标签清空，不留孤儿标签。
+     *  两件事放同一个事务里 —— 分开写若中途中断，会留下「账目标签清了、标签还在」的孤儿标签。 */
     fun deleteTag(tag: AccTagEntity) = viewModelScope.launch(Dispatchers.IO) {
-        accountDao.clearTag(tag.name)
-        tagDao.delete(tag.id)
+        AppContainer.database.withTransaction {
+            accountDao.clearTag(tag.name)
+            tagDao.delete(tag.id)
+        }
     }
 
 
     // ===== 备份 / 恢复 =====
     /**
-     * 备份文件格式版本。
-     * 改动任何一张表的字段/含义（或 buildBackupJson 的输出结构）时都要 +1，
+     * 备份文件**格式**版本。改动任何一张表的字段/含义（或 buildBackupJson 的输出结构）时都要 +1，
      * 这样将来恢复旧文件才能知道"这份文件是什么年代导的、缺哪些字段"。
      * 1 = 初版（漏 priority/sortOrder/doneAt）；2 = 补齐 todos 三项 + 记 dbVersion/appVersion。
+     * 读文件那边在 [BackupCodec.SCHEMA]（同一个数，纯函数好单测）。
      */
-    companion object { const val BACKUP_SCHEMA = 2 }
+    companion object { const val BACKUP_SCHEMA = BackupCodec.SCHEMA }
 
     suspend fun buildBackupJson(): String = withContext(Dispatchers.IO) {
         val root = JSONObject()
@@ -403,77 +408,54 @@ class SettingsViewModel : ViewModel() {
         root.toString(2)
     }
 
-    /** 返回恢复的记录条数；-1 表示文件格式不对 */
+    /**
+     * 检查一份备份文件（恢复前先看内容，不碰数据库）。
+     * 返回 Ok = 可用（[BackupCodec.Data.summary] 是给用户看的概览）；Bad = 不可用（[BackupCodec.Result.Bad.why] 是原因）。
+     */
+    suspend fun inspectBackup(json: String): BackupCodec.Result = withContext(Dispatchers.IO) {
+        BackupCodec.parse(json)
+    }
+
+    /**
+     * 恢复。返回恢复的记录条数；负数 = 失败码（-1 格式 / -2 更新版本 / -3 内容损坏 / -4 写库失败）。
+     *
+     * 顺序很要紧：**先整份解析校验（纯函数、不碰库）→ 通过后再在一个事务里落库**。
+     * 老实现是一边解析一边 `clear()` + `insert()`：文件里有一条坏记录就停在半途，
+     * 库里已经被清空、只写回一半（恢复失败 = 数据没了）。
+     *
+     * 各表**只在文件里确实有那一段时才清空**：缺段说明这份备份没导出那张表，
+     * 保持现有数据不动（老实现不看存在性，一份只有 todos 的文件会把账目/标签全清掉）。
+     *
+     * 界面设置则相反 —— 这一组**整组以备份为准**（文件里有哪几项就写哪几项，没写的回到默认），
+     * 因为「备份 = 那一刻的完整状态」。理由详见 AppDatabase.PREF_KEYS 的注释。
+     */
     suspend fun restoreFromJson(json: String): Int = withContext(Dispatchers.IO) {
-        val root = try { JSONObject(json) } catch (_: Exception) { return@withContext -1 }
-        if (root.optJSONArray("todos") == null && root.optJSONArray("accounts") == null) return@withContext -1
-
-        // 旧版文件（schema 1）没有 priority/sortOrder/doneAt，取默认 0 即可；
-        // 将来 schema 再升，这里按来源版本分支处理，别一律当新版读。
-        val srcSchema = root.optInt("schema", 1)
-        if (srcSchema > BACKUP_SCHEMA) return@withContext -2   // 来自更新的版本，字段可能读不懂
-
-        var n = 0
-
-        todoDao.clear()
-        root.optJSONArray("todos")?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                todoDao.insert(Todo(id = o.optLong("id"), title = o.optString("title"),
-                    detail = o.optString("detail"), done = o.optBoolean("done"),
-                    dueDate = o.optLong("dueDate"), createdAt = o.optLong("createdAt"),
-                    // 旧备份文件里没有这三项 → optInt/optLong 取默认 0，行为与从前一致
-                    priority = o.optInt("priority", 0),
-                    sortOrder = o.optInt("sortOrder", 0),
-                    doneAt = o.optLong("doneAt", 0L)))
-                n++
-            }
+        val data = when (val r = BackupCodec.parse(json)) {
+            is BackupCodec.Result.Bad -> return@withContext r.code
+            is BackupCodec.Result.Ok -> r.data
         }
-        accountDao.clear()
-        root.optJSONArray("accounts")?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                accountDao.insert(Account(id = o.optLong("id"), title = o.optString("title"),
-                    amountCents = o.optLong("amountCents"), type = o.optInt("type"),
-                    tag = o.optString("tag"), date = o.optLong("date")))
-                n++
+        try {
+            AppContainer.database.withTransaction {
+                data.todos?.let { list -> todoDao.clear(); list.forEach { todoDao.insert(it) } }
+                data.accounts?.let { list -> accountDao.clear(); list.forEach { accountDao.insert(it) } }
+                data.loopTodos?.let { list -> loopDao.clear(); list.forEach { loopDao.insert(it) } }
+                data.accTags?.let { list -> tagDao.clear(); list.forEach { tagDao.upsert(it) } }
+                data.quickEntries?.let { list -> quickDao.clear(); list.forEach { quickDao.insert(it) } }
+                // 界面设置整组替换；文件里一项设置都没有（老文件）就整组不动，免得把现有外观抹成默认
+                if (data.prefs.isNotEmpty()) {
+                    prefDao.removeAll(AppDatabase.PREF_KEYS)
+                    data.prefs.forEach { (k, v) ->
+                        // 底栏顺序顺手规范化：存档里可能还留着已删掉的「模型」那一项，
+                        // 规范化后再写，值本身就不会一直脏着传下去
+                        val clean = if (k == "tab_order") parseTabOrder(v)?.joinToString(",") ?: v else v
+                        prefDao.put(AppPref(k, clean))
+                    }
+                }
             }
+        } catch (e: Exception) {
+            return@withContext -4
         }
-        loopDao.clear()
-        root.optJSONArray("loopTodos")?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                loopDao.insert(LoopTodo(id = o.optLong("id"), title = o.optString("title"),
-                    detail = o.optString("detail"), dayOfWeek = o.optInt("dayOfWeek"),
-                    doneThisWeek = o.optBoolean("doneThisWeek")))
-                n++
-            }
-        }
-        tagDao.clear()
-        root.optJSONArray("accTags")?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                tagDao.upsert(AccTagEntity(id = o.optLong("id"), name = o.optString("name"),
-                    color = o.optLong("color"), icon = o.optString("icon")))
-                n++
-            }
-        }
-        quickDao.clear()
-        root.optJSONArray("quickEntries")?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                quickDao.insert(QuickEntry(id = o.optLong("id"), title = o.optString("title"),
-                    amountCents = o.optLong("amountCents"), type = o.optInt("type"),
-                    tag = o.optString("tag"), sortOrder = o.optInt("sortOrder")))
-                n++
-            }
-        }
-        root.optString("pref_budget").takeIf { it.isNotBlank() }?.let { prefDao.put(AppPref("budget_month", it)) }
-        root.optString("pref_font_scale").takeIf { it.isNotBlank() }?.let { prefDao.put(AppPref("font_scale", it)) }
-        root.optString("pref_songti").takeIf { it.isNotBlank() }?.let { prefDao.put(AppPref("songti", it)) }
-        root.optString("pref_dark").takeIf { it.isNotBlank() }?.let { prefDao.put(AppPref("dark", it)) }
-        root.optString("pref_tab_order").takeIf { it.isNotBlank() }?.let { prefDao.put(AppPref("tab_order", it)) }
-        n
+        data.count
     }
 }
 
@@ -981,7 +963,7 @@ private fun BillsOverviewPage(vm: SettingsViewModel = viewModel()) {
             modifier = Modifier.padding(top = 14.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             listOf("month" to "本月", "year" to "今年", "all" to "全部", "custom" to "自定义").forEach { (k, label) ->
-                FilterChip(selected = range == k, onClick = { range = k }, label = { Text(label, fontSize = 13.sp) })
+                ShixuChip(selected = range == k, onClick = { range = k }, label = { Text(label, fontSize = 13.sp) })
             }
         }
         if (range == "custom") {
@@ -992,7 +974,7 @@ private fun BillsOverviewPage(vm: SettingsViewModel = viewModel()) {
             modifier = Modifier.padding(top = 10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("csv" to "CSV", "txt" to "文本").forEach { (k, label) ->
-                FilterChip(selected = fmt == k, onClick = { fmt = k }, label = { Text(label, fontSize = 13.sp) })
+                ShixuChip(selected = fmt == k, onClick = { fmt = k }, label = { Text(label, fontSize = 13.sp) })
             }
         }
         Button(onClick = {
@@ -1065,6 +1047,25 @@ private fun BackupPage(vm: SettingsViewModel = viewModel()) {
     /** 点「从备份文件恢复」后先做自动备份，备份流程收尾时再弹确认框 */
     var wantRestore by remember { mutableStateOf(false) }
     var confirmRestore by remember { mutableStateOf(false) }
+    /** 已经读进来、检查通过、等着用户确认的那份备份 */
+    var pendingJson by remember { mutableStateOf<String?>(null) }
+    var pendingSummary by remember { mutableStateOf("") }
+
+    /** 真正落库。成功后提示条要说明「设置已即时生效」，见 MainScreen 里监听偏好表那段 */
+    fun runRestore(json: String) {
+        if (busy) return
+        busy = true
+        scope.launch {
+            when (val n = vm.restoreFromJson(json)) {
+                -2 -> toast(ctx, "这份备份来自更新的版本，请先升级 App")
+                -1 -> toast(ctx, "文件格式不正确")
+                -3 -> toast(ctx, "文件内容损坏，已保持原数据不变")
+                -4 -> toast(ctx, "写入失败，数据未被修改")
+                else -> toast(ctx, "已恢复 $n 条记录")
+            }
+            busy = false
+        }
+    }
 
     fun stampName(): String {
         val c = DateUtils.calAt(System.currentTimeMillis())
@@ -1156,12 +1157,17 @@ private fun BackupPage(vm: SettingsViewModel = viewModel()) {
                         ctx.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
                     } catch (_: Exception) { "" }
                 }
-                when {
-                    text.isBlank() -> toast(ctx, "读取文件失败")
-                    else -> when (val n = vm.restoreFromJson(text)) {
-                        -2 -> toast(ctx, "这个备份来自更新的版本，请先升级 App")
-                        -1 -> toast(ctx, "文件格式不正确")
-                        else -> toast(ctx, "已恢复 $n 条记录")
+                if (text.isBlank()) {
+                    toast(ctx, "读取文件失败")
+                } else {
+                    // 先只**检查**文件（不碰数据库）：把里面有什么念给用户听，确认后才真恢复。
+                    // 检查不过就直接拒绝 —— 老实现是边解析边写库，坏文件会把库清一半。
+                    when (val r = vm.inspectBackup(text)) {
+                        is BackupCodec.Result.Bad -> toast(ctx, "这份备份不能用：${r.why}")
+                        is BackupCodec.Result.Ok -> {
+                            pendingJson = text
+                            pendingSummary = r.data.summary()
+                        }
                     }
                 }
                 busy = false
@@ -1197,6 +1203,10 @@ private fun BackupPage(vm: SettingsViewModel = viewModel()) {
         }, enabled = !busy, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
             Text("分享备份文件")
         }
+        // 分享这条路径最容易泄数据（可能顺手发进群里）：文件是**明文** JSON、含账目金额，
+        // 这里明确说一句。缓存副本（cacheDir/backup_share）下次分享时会被清掉，也提一下。
+        LabelText("备份是明文 JSON，里面含账目金额，分享前确认收件人；App 里留的缓存副本下次分享时会自动清掉。",
+            12, MaterialTheme.colorScheme.onSurfaceVariant)
 
         OutlinedButton(onClick = {
             // 先备份、再恢复：这一串走完才弹「确认恢复？」
@@ -1230,6 +1240,30 @@ private fun BackupPage(vm: SettingsViewModel = viewModel()) {
                 TextButton(onClick = { confirmRestore = false; openLauncher.launch(arrayOf("application/json", "*/*")) }) { Text("选择文件") }
             },
             dismissButton = { TextButton(onClick = { confirmRestore = false }) { Text("取消") } })
+    }
+
+    // 选定文件、检查通过后的**第二次确认**：把这份备份里到底有什么念清楚再动手
+    //（原来选完文件直接覆盖，用户完全不知道选中的是不是自己要的那一份）。
+    pendingJson?.let { json ->
+        AlertDialog(
+            shape = GlassDialogShape,
+            containerColor = glassDialogContainer(),
+            modifier = glassDialogModifier(),
+            onDismissRequest = { pendingJson = null },
+            title = { Text("将恢复这份备份") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(pendingSummary, fontSize = 13.sp)
+                    Text("恢复会用它替换当前全部待办、账目、标签与界面设置，不可撤销。",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { pendingJson = null; runRestore(json) }) { Text("恢复") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingJson = null; toast(ctx, "已取消，未做任何修改") }) { Text("取消") }
+            })
     }
 }
 
@@ -1325,15 +1359,15 @@ private fun QuickEntryPage(vm: SettingsViewModel = viewModel()) {
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.fillMaxWidth())
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(selected = !isIncome, onClick = { isIncome = false }, label = { Text("支出") })
-                        FilterChip(selected = isIncome, onClick = { isIncome = true }, label = { Text("收入") })
+                        ShixuChip(selected = !isIncome, onClick = { isIncome = false }, label = { Text("支出") })
+                        ShixuChip(selected = isIncome, onClick = { isIncome = true }, label = { Text("收入") })
                     }
                     if (tags.isNotEmpty()) {
                         Text("标签（可选）", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             tags.forEach { t ->
-                                FilterChip(
+                                ShixuChip(
                                     selected = tag == t.name,
                                     onClick = { tag = if (tag == t.name) "" else t.name },
                                     label = { Text(t.name) }

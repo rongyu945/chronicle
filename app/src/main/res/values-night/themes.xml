@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      深色（系统夜间模式）下的启动主题。
+      values/themes.xml 里那份是 Light 主题 + 白色窗口底 + windowLightStatusBar=true，
+      系统在深色模式下冷启动时会先按它画一帧 → 用户看到「深色界面之前先闪一片白」。
+
+      这里只用系统夜间资源（values-night）覆盖窗口底色与状态栏亮暗，
+      不动 App 内部的主题：App 的明暗仍由设置里的「外观模式」决定（跟随系统/常亮/常暗）。
+    -->
+    <style name="Theme.ShixuJi" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/shixuji_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@color/shixuji_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

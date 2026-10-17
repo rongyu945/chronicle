@@ -29,6 +29,40 @@ import com.rongyu.shixuji.theme.isDarkTheme
 data class TabItem(val label: String, val iconRes: Int)
 
 /**
+ * 底栏整体**等比缩放系数**（唯一真源）。
+ *
+ * 用户 2026-10-16：「底栏有点大了，适当缩小一点，就是等比例缩小」→ 胶囊高度 / 圆钮 / 图标 /
+ * 文字 / 文字行高 / 图标与文字间距全部由它派生，改这一个数就整体等比变。
+ * 悬浮按钮的落点也跟着走（见 [FAB_CLEARANCE]），否则底栏矮下去后 ＋ / 今 会显得悬空。
+ */
+internal const val TAB_BAR_SCALE = 0.90f
+/** 胶囊高度（基准 64dp × 系数） */
+internal val TAB_BAR_HEIGHT = (64 * TAB_BAR_SCALE).dp
+/** 胶囊比基准矮掉的高度 */
+internal val TAB_BAR_SHIFT = (64 * (1 - TAB_BAR_SCALE)).dp
+/** 悬浮按钮距屏幕底（基准 92dp）—— 跟着底栏一起往下收，保持与底栏同样的视觉间距 */
+internal val FAB_CLEARANCE = 92.dp - TAB_BAR_SHIFT
+
+/**
+ * 列表底部留白（待办页 / 账目页共用同一份）。
+ *
+ * 要盖住「玻璃底栏 + 两个悬浮按钮」的高度，所以比 [FAB_CLEARANCE] 大不少；
+ * 两页原本各写了一份 private 的 180dp —— 两处独立写死的数迟早会走散
+ * （改一页忘另一页，用户看到的就是「这页能滑到底、那页最后一条压着底栏」），
+ * 统一放到这里，要调一起调。
+ */
+internal val LIST_BOTTOM = 180.dp
+
+/**
+ * 没有悬浮按钮的页面（设置页各二级页）的底部留白。
+ *
+ * 比 [LIST_BOTTOM] 小 30dp：设置页没有 ＋ / 今 两个悬浮钮，只需让最后一行不被玻璃底栏压住。
+ * 原来这两处各写了一个裸的 `150.dp`，和列表页的 180 一样是"写死的数迟早走散"，
+ * 一起挪到这里 —— 要让全部页面同时抬起来，改这两行就够。
+ */
+internal val LIST_BOTTOM_PLAIN = 150.dp
+
+/**
  * 浮动玻璃胶囊底栏。
  *
  * 三个图标是自绘的同一套（24 网格 / 2dp 描边 / 圆头端点），视觉重量一致。
@@ -45,16 +79,16 @@ fun GlassBottomBar(
     modifier: Modifier = Modifier,
     backdrop: LiquidGlassBackdropState? = null,
 ) {
-    val shape = RoundedCornerShape(34.dp)
-    val circleSize = 56.dp
-    val barHeight = 64.dp
+    val shape = RoundedCornerShape((34 * TAB_BAR_SCALE).dp)
+    val circleSize = (56 * TAB_BAR_SCALE).dp
+    val barHeight = TAB_BAR_HEIGHT
 
     // 底栏形状（给液态玻璃的折射用）。外层 BoxWithConstraints 只负责量尺寸，
     // 真正画玻璃的是它里面那层 —— 这样玻璃层的坐标正好等于胶囊矩形。
     // 三图标重构（用户删掉「模型」后要求）：胶囊不再靠左右 34dp 边距拉满整屏，
     // 而是「每项固定 84dp」收紧成一小条居中 —— 三项散在大宽屏上会显得很空。
     // 每项 84dp 与四项时代的 85.75dp 基本一致，图标观感不变，胶囊总宽 252dp。
-    val itemWidth = 84.dp
+    val itemWidth = (84 * TAB_BAR_SCALE).dp
     BoxWithConstraints(
         modifier.height(barHeight)
     ) {
@@ -122,14 +156,14 @@ fun GlassBottomBar(
                             tint = if (selected) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier
-                                .size(24.dp)
+                                .size((24 * TAB_BAR_SCALE).dp)
                                 .graphicsLayer { scaleX = iconScale; scaleY = iconScale }
                         )
-                        Spacer(Modifier.height(1.5.dp))
+                        Spacer(Modifier.height((1.5 * TAB_BAR_SCALE).dp))
                         Text(
                             item.label,
-                            fontSize = 11.sp,
-                            lineHeight = 12.sp,
+                            fontSize = (11 * TAB_BAR_SCALE).sp,
+                            lineHeight = (12 * TAB_BAR_SCALE).sp,
                             color = if (selected) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant
                         )

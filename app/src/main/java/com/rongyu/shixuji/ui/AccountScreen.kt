@@ -27,6 +27,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.animate
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.material3.*
 import androidx.compose.material3.TextButton
@@ -65,14 +67,19 @@ import com.rongyu.shixuji.data.AccTagEntity
 import com.rongyu.shixuji.data.Account
 import com.rongyu.shixuji.data.QuickEntry
 import com.rongyu.shixuji.theme.*
+import com.rongyu.shixuji.ui.motion.UnifiedWeekDayNavigator
+import com.rongyu.shixuji.ui.motion.rememberReducedMotion
+import com.rongyu.shixuji.ui.motion.toLocalDate
+import com.rongyu.shixuji.ui.motion.toStartMs
+import java.time.LocalDate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.util.Calendar
 
-private val FAB_BOTTOM = 92.dp
+private val FAB_BOTTOM = FAB_CLEARANCE   // 跟着底栏等比缩放（原来写死 92dp，底栏收缩后会悬空）
 /** 「今」按钮：「＋」上方 64dp（原来 54dp 太近容易误触；改到 72dp 又太散，取中间） */
 private val FAB_TODAY_OFFSET = 56.dp
-private val LIST_BOTTOM = 180.dp
+// 列表底部留白 LIST_BOTTOM 与待办页共用同一份（见 BottomTabBar.kt），不要在这里再写一个
 
 class AccountViewModel : ViewModel() {
     private val dao = AppContainer.database.accountDao()
@@ -101,15 +108,11 @@ class AccountViewModel : ViewModel() {
     }
 
     /**
-     * 新增并回传新条 id（提示条的「撤回」要按 id 删）。
-     * 先取 id 再插 —— 不用等 insert 返回，界面仍是「保存即关弹窗」。
+     * 新增账目。用 Room `@Insert` 返回的真实 rowId（原来先 `MAX(id)+1` 猜一个：
+     * 与插入非原子、且删过最大 id 后会复用 —— 复用时按 id 撤回会覆盖另一条）。
      */
-    suspend fun addReturningId(title: String, cents: Long, tag: String, isIncome: Boolean, dateMs: Long): Long {
-        val nextId = dao.nextId()
-        dao.insert(Account(id = nextId, title = title, amountCents = cents,
-            type = if (isIncome) 1 else 0, tag = tag, date = dateMs))
-        return nextId
-    }
+    suspend fun addReturningId(title: String, cents: Long, tag: String, isIncome: Boolean, dateMs: Long): Long =
+        dao.insert(Account(title = title, amountCents = cents, type = if (isIncome) 1 else 0, tag = tag, date = dateMs))
 
     /**
      * 修改并回传「改之前」的完整快照（提示条的「撤回」要整条还原）。
@@ -151,7 +154,6 @@ fun AccountScreen(
     val scope = rememberCoroutineScope()
 
     val today = remember(todayTick) { DateUtils.todayCal() }
-    val isThisWeek = DateUtils.isSameDay(DateUtils.startOfWeek(shownDay), DateUtils.startOfWeek(today))
 
     // ★ 每个「显示日」一个独立的 LazyListState（普通 Map 当缓存，不是 Compose 状态）。
     //
@@ -164,11 +166,31 @@ fun AccountScreen(
     val dayStates = remember { mutableMapOf<Long, LazyListState>() }
     val shownDayStartMs = DateUtils.startOfDayMs(shownDayMs)
     fun dayListState(dayMs: Long) = dayStates.getOrPut(dayMs) { LazyListState() }
-    val listState = dayListState(shownDayStartMs)
+    // 统一周条组件报回来的「视觉上已落位」的那一天（不是已请求但还没滑到的目标日）：
+    // 列表滚动状态与标题折叠按它取，否则表头/汇总会先变、列表后到。
+    var anchorDayMs by remember { mutableLongStateOf(shownDayStartMs) }
+    val anchorDayStartMs = DateUtils.startOfDayMs(anchorDayMs)
+    val listState = dayListState(anchorDayStartMs)
     LaunchedEffect(shownDayStartMs) {
         val c = DateUtils.calFrom(shownDayStartMs)
         val keep = (-1..1).map { DateUtils.startOfDayMs(DateUtils.addDays(c, it).timeInMillis) }.toHashSet()
         dayStates.keys.retainAll(keep)
+    }
+
+    // ★ 周条 + 日列表 = 统一周条组件 ui/motion/UnifiedWeekDayNavigator（2026-10-16 重构，
+    //   与待办页共用同一套实现）。旧版这里是 dayNav / stripNav / dayFrac 三套运动互相补同步：
+    //   差一天走一页、更远淡换、跨周还要在 onCommit 里补一条周条动画 —— 既脆又必然两段式。
+    //   现在只有一个 offsetFraction，输入、运动、反馈同源。
+    val todayDate = remember(todayTick) { DateUtils.startOfDayMs(DateUtils.todayCal().timeInMillis).toLocalDate() }
+    val reducedMotion = rememberReducedMotion()
+
+    /**
+     * 所有「换一天」的入口都走这里：「今」、点周条日期、记一笔/改账目后跳过去。
+     * 只改状态 —— 动画（走一页 / 滑红点 / 整体淡换）由统一周条组件自己按目标
+     * 与「已落位日期」的差决定，调用方不再判断差几天、跨不跨周。
+     */
+    fun goDay(targetMs: Long) {
+        shownDayMs = DateUtils.startOfDayMs(targetMs)
     }
 
     // 大标题折叠：列表滚动时标题 28sp → 17sp，并浮出半透明标题条
@@ -225,6 +247,10 @@ fun AccountScreen(
     val weekAcc = remember(swipeAcc, weekStartMs, weekEndMs) {
         swipeAcc.filter { it.date in weekStartMs..weekEndMs }
     }
+    // 事件日（哪些天有账目）：交给统一周条组件画小圆点
+    val eventDates: Set<LocalDate> = remember(swipeAcc) {
+        swipeAcc.map { DateUtils.startOfDayMs(it.date).toLocalDate() }.toHashSet()
+    }
 
     val dayEndMs = DateUtils.endOfDayMs(shownDayMs)
     val dayAcc = remember(weekAcc, shownDayMs, dayEndMs) {
@@ -279,7 +305,7 @@ fun AccountScreen(
                                     vm.add(q.title, q.amountCents, q.tag, q.type == 1, now)
                                     // 快捷记账固定记在「今天」：当前若看着别的日期就跳过去，
                                     // 否则记完在当前页看不到这笔（像没记上）
-                                    shownDayMs = DateUtils.startOfDayMs(now)
+                                    goDay(now)
                                     // 不再在这里 scrollToItem(0)：那是和写库并行的协程，会抢在
                                     // 数据到达之前滚，反而把列表锚在原位（详见列表区那段注释）。
                                     // 回顶统一由「当天数据变化」那个 LaunchedEffect 负责。
@@ -300,137 +326,87 @@ fun AccountScreen(
 
             Spacer(Modifier.height(10.dp))
 
-            // 周视图拆成两块区域、各管各的横滑：
-            //   上 = 周条区（在条上左右滑 → 切周），下 = 账目列表区（在列表上左右滑 → 切天）
-            val dayFrac = remember { mutableFloatStateOf(0f) }
-            Column(Modifier.weight(1f)) {
-                // —— 周条区：左右滑动切换一周 ——
-                // 必须给固定高度：PeriodSwipe 内部 fillMaxSize，不给高度会吃光剩余空间，
-                // 下方账目列表 weight(1f) 被挤成 0 → "在列表上滑"其实还在切周。
-                // 70dp = 上下内边距 8 + 星期行 15 + 圆 32 + 点(5+4) 9，留余量给字号放大档
-                PeriodSwipe(
-                    modifier = Modifier.fillMaxWidth().height(70.dp),
-                    onCommit = { dir ->
-                        // 周条换周维持原方向（手往左 = 下一周）；用户明确只要改"切天"的方向
-                        shownDayMs = DateUtils.addDays(DateUtils.calFrom(shownDayMs), 7 * dir).timeInMillis
-                    }
-                ) { off ->
-                    val pageDay = remember(shownDayMs, off) {
-                        DateUtils.addDays(DateUtils.calFrom(shownDayMs), 7 * off)
-                    }
-                    val pageWeekStart = DateUtils.startOfWeek(pageDay)
-                    val pStartMs = pageWeekStart.timeInMillis
-                    val pEndMs = DateUtils.endOfDayMs(DateUtils.addDays(pageWeekStart, 6).timeInMillis)
-                    val pWeekAcc = remember(swipeAcc, pStartMs, pEndMs) {
-                        swipeAcc.filter { it.date in pStartMs..pEndMs }
-                    }
-                    // 跨周时整条周条的 7 格会同时换掉。原来这里套了一层 Crossfade(150ms)，
-                    // 以为"淡换比硬切顺"——实际相反：Crossfade 只在跨周时命中，把整条周条
-                    // **同时合成两份**（新旧各一份）并各建离屏图层，实测跨周最差帧 ≈1095ms
-                    //（周内 ≈323ms）。去掉后只是数字瞬换一下，反而没有"卡一下"了。
-                    AccountWeekStrip(pageDay, today, pWeekAcc,
-                        onSelectDay = { shownDayMs = it.timeInMillis },
-                        dragFrac = { dayFrac.floatValue })
+            // ★ 统一周条组件（与待办页共用同一个实现）：
+            //   一条运动状态同时驱动 周条 + 那枚红点 + 账目列表。跨周拖动时日期带在
+            //   拖动第一帧就跟着手指走；红点整条只画一枚。旧版「日列表滑完周条才补滑」
+            //   的两段式、以及跨周第一帧红圈换格，在这个组件里都不存在。
+            UnifiedWeekDayNavigator(
+                selectedDate = shownDayMs.toLocalDate(),
+                onSelectedDateChange = { d -> shownDayMs = d.toStartMs() },
+                onAnchorDateChange = { d -> anchorDayMs = d.toStartMs() },
+                eventDates = eventDates,
+                today = todayDate,
+                reducedMotion = reducedMotion,
+                modifier = Modifier.weight(1f)
+            ) { date ->
+                val pageDayMs = DateUtils.startOfDayMs(date.toStartMs())
+                val slotState = dayListState(pageDayMs)
+                val isCenter = pageDayMs == anchorDayStartMs
+                // 必须 remember：组件同时画三页，不缓存的话每帧过滤三遍
+                val pDayAcc = remember(swipeAcc, pageDayMs) {
+                    swipeAcc.filter { it.date in pageDayMs..DateUtils.endOfDayMs(pageDayMs) }
                 }
-                Spacer(Modifier.height(2.dp))
-                // —— 账目列表区：左右滑动切换一天 ——
-                // 方向和换周/年/月一致：手往左 = 下一天（内容从右边进来）。
-                // 周条上那枚红圆因此是朝「新进来的那一天」滑（位置 = 选中格 - 手指进度）。
-                PeriodSwipe(
-                    modifier = Modifier.weight(1f),
-                    onProgress = { f -> dayFrac.floatValue = f },
-                    onCommit = { dir ->
-                        shownDayMs = DateUtils.addDays(DateUtils.calFrom(shownDayMs), dir).timeInMillis
-                    }
-                ) { off ->
-                    val pageDay = remember(shownDayMs, off) {
-                        DateUtils.addDays(DateUtils.calFrom(shownDayMs), off)
-                    }
-                    val pageDayMs = pageDay.timeInMillis
-                    // 按「这一天」取 state：中心页和侧页是同一个实例 → 滑进来看到什么就留什么
-                    val slotState = dayListState(DateUtils.startOfDayMs(pageDayMs))
-                    // 必须 remember：PeriodSwipe 同时画三页，不缓存的话每帧过滤三遍
-                    val pDayAcc = remember(swipeAcc, pageDayMs) {
-                        swipeAcc.filter { it.date in pageDayMs..DateUtils.endOfDayMs(pageDayMs) }
-                    }
-                    // 分组 + 排序同样要 remember：按标签分组要排序+建 Map，条目多时每帧都在算
-                    // （三页 = 每帧三遍）。注意只能在 @Composable 上下文里 remember，
-                    // 不能写进 LazyColumn 的 content lambda（那是 LazyListScope，不参与重组）。
-                    val grouped = remember(pDayAcc) {
-                        pDayAcc.sortedByDescending { it.date }.groupBy { it.tag }
-                    }
-
-                    // 侧页（不是当前显示日）只要它那天变了就先归零：跟着手指滑进来的那一页
-                    // 永远从第一条开始，落位后中心页用的就是这个 state，松手瞬间不会跳。
-                    LaunchedEffect(off, pageDayMs) {
-                        if (off != 0) slotState.scrollToItem(0)
-                    }
-                    // ★ 回顶要「等数据真的变了」再滚，而且只能有一个触发源。
-                    //
-                    // 旧写法是保存时 `scope.launch { listState.scrollToItem(0) }` —— 它和
-                    // 写库是**两条并行协程**：滚动常常先执行，那时列表里还没有新条目；
-                    // 等 Room 的 Flow 把新数据推过来，LazyColumn 会按 key 把「原先可见那一条」
-                    // 锚在原位，新条目被插到它**上面**、看不见 —— 观感就是没回到第一条。
-                    // 你当时是停在底部就"直接到底"、停在中间就"卡在半路"，正是这个锚定行为。
-                    //
-                    // 现在改成挂在**当天数据**上：只要这一天的条目集合变了（新增/删除/改日期），
-                    // 就重新滚到第一条。数据没变时（用户只是自己在读）绝不乱跳。
-                    // 侧页（off≠0）不滚，避免和中心页抢同一个 state。
-                    // 用 animateScrollToItem（平滑动画）而不是瞬移的 requestScrollToItem ——
-                    // 与待办页同一口径（用户 2026-10-14：从列表尾部瞬移到头部「跳起来很难看」）。
-                    LaunchedEffect(off, pageDayMs, pDayAcc.size, pDayAcc.firstOrNull()?.id) {
-                        if (off == 0) slotState.animateScrollToItem(0)
-                    }
-
-                    Column(Modifier.fillMaxSize()) {
-
-                    // 只显示当天的账目，按标签分组（同标签吸附，不折叠）
-                    LazyColumn(
-                        state = slotState,
-                        modifier = Modifier.weight(1f),
-                        contentPadding = PaddingValues(16.dp, 8.dp, 16.dp, LIST_BOTTOM),
-                        verticalArrangement = Arrangement.spacedBy(5.dp)
-                    ) {
-                        if (pDayAcc.isEmpty()) {
-                            // 空列表不再写提示字（右下角 ＋ 就在旁边）
-                        } else {
-                            grouped.forEach { (tag, list) ->
-                                val tagColor = tagColorMap[tag] ?: Color(0xFFC7C7CC)
-                                if (tag.isNotBlank()) {
-                                    item(key = "h-$tag") {
-                                        Text(tag, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.padding(start = 6.dp, top = 8.dp, bottom = 2.dp))
-                                    }
+                // 分组 + 排序同样要 remember：按标签分组要排序+建 Map，条目多时每帧都在算
+                val grouped = remember(pDayAcc) {
+                    pDayAcc.sortedByDescending { it.date }.groupBy { it.tag }
+                }
+                // 侧页（不是当前已落位的那一天）先归零：跟着手指滑进来的那一页
+                // 永远从第一条开始；落位后中心页用的就是这个 state，松手瞬间不跳。
+                LaunchedEffect(pageDayMs, isCenter) {
+                    if (!isCenter) slotState.scrollToItem(0)
+                }
+                // ★ 回顶只在「当天数据真的变了」时触发：旧写法在保存回调里直接滚，和写库
+                //   并行 —— 滚动先执行、数据还没到，等 Flow 推来新条目时 LazyColumn 会按 key
+                //   把原可见那条锚在原位，新条目插在它上面看不见。用 animateScrollToItem
+                //   （平滑）而不是瞬移版：与待办页同一口径（用户 2026-10-14：「跳起来很难看」）。
+                LaunchedEffect(pageDayMs, pDayAcc.size, pDayAcc.firstOrNull()?.id) {
+                    if (pageDayMs == anchorDayStartMs) slotState.animateScrollToItem(0)
+                }
+                // 只显示当天的账目，按标签分组（同标签吸附，不折叠）
+                LazyColumn(
+                    state = slotState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(16.dp, 8.dp, 16.dp, LIST_BOTTOM),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    if (pDayAcc.isEmpty()) {
+                        // 空列表不再写提示字（右下角 ＋ 就在旁边）
+                    } else {
+                        grouped.forEach { (tag, list) ->
+                            val tagColor = tagColorMap[tag] ?: Color(0xFFC7C7CC)
+                            if (tag.isNotBlank()) {
+                                item(key = "h-$tag") {
+                                    Text(tag, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(start = 6.dp, top = 8.dp, bottom = 2.dp))
                                 }
-                                items(list, key = { it.id }) { acc ->
-                                    SwipeRow(
-                                        actions = listOf("编辑" to Color(0xFF8E8E93), "删除" to MaterialTheme.colorScheme.primary),
-                                        onAction = { i ->
-                                            if (i == 0) editTarget = acc
-                                            else {
-                                                vm.delete(acc.id)
-                                                undo.show("已删除：${accountTitle(acc)}") { vm.restore(acc) }
-                                            }
-                                        },
-                                        enabled = false,
-                                        // 切天时同一批账目可能换序，位置动画会造成"乱窜"，只保留占位不带动画
-                                        modifier = Modifier.animateItem(
-                                            fadeInSpec = null, placementSpec = null, fadeOutSpec = null
-                                        )
-                                    ) {
-                                        AccountRow(
-                                            acc = acc, tagColor = tagColor,
-                                            onOpenDetail = { detailTarget = acc }
-                                        )
-                                    }
+                            }
+                            items(list, key = { it.id }) { acc ->
+                                SwipeRow(
+                                    actions = listOf("编辑" to Color(0xFF8E8E93), "删除" to MaterialTheme.colorScheme.primary),
+                                    onAction = { i ->
+                                        if (i == 0) editTarget = acc
+                                        else {
+                                            vm.delete(acc.id)
+                                            undo.show("已删除：${accountTitle(acc)}") { vm.restore(acc) }
+                                        }
+                                    },
+                                    enabled = false,
+                                    // 切天时同一批账目可能换序，位置动画会造成"乱窜"，只保留占位不带动画
+                                    modifier = Modifier.animateItem(
+                                        fadeInSpec = null, placementSpec = null, fadeOutSpec = null
+                                    )
+                                ) {
+                                    AccountRow(
+                                        acc = acc, tagColor = tagColor,
+                                        onOpenDetail = { detailTarget = acc }
+                                    )
                                 }
                             }
                         }
                     }
                 }
-                }
-                }
+            }
             }
 
         // 同待办：磨砂玻璃圆（和底栏同一套液态玻璃），不用 FAB（避免阴影叠出多边形亮边）
@@ -460,7 +436,7 @@ fun AccountScreen(
                 labelColor = MaterialTheme.colorScheme.primary,
                 labelSize = 14.sp, labelBold = true,
                 contentDescription = "回到今天",
-                onClick = { shownDayMs = today.timeInMillis },
+                onClick = { goDay(today.timeInMillis) },
                 backdrop = fabLayer,
                 modifier = Modifier.padding(20.dp).padding(bottom = FAB_BOTTOM + FAB_TODAY_OFFSET)
             )
@@ -478,8 +454,8 @@ fun AccountScreen(
                 // 新增不再弹撤回提示条（用户 2026-10-12：只保留删除的撤回），直接落库即可
                 vm.add(t, cents, tag, isIncome, dateMs)
                 // 记完一笔要「跳到这一笔所在的那天」——记的是别的日期时，不跳过去当前这天
-                // 就看不到它，像没记上。日期相同则赋值是无操作，页面原地不动。
-                shownDayMs = DateUtils.startOfDayMs(dateMs)
+                // 就看不到它，像没记上。日期相同则 goDay 里直接返回，页面原地不动。
+                goDay(dateMs)
             },
             onDismiss = { showAdd = false }
         )
@@ -496,13 +472,13 @@ fun AccountScreen(
                         undo.show("已保存：${if (t.isBlank()) formatCents(cents) else t}") {
                             vm.restoreFull(old)
                             // 撤回修改：整条还原 + 跳回它原来所在的那一天（不然看着像没还原）
-                            shownDayMs = DateUtils.startOfDayMs(old.date)
+                            goDay(old.date)
                         }
                     }
                 }
                 // 改完也一样：跳到改后的日期（改到别的日期时当前页就看不到它了）；
                 // 回顶同样交给「当天数据变化」统一处理。
-                shownDayMs = DateUtils.startOfDayMs(dateMs)
+                goDay(dateMs)
             },
             onDismiss = { editTarget = null }
         )
@@ -646,79 +622,6 @@ private fun HeroCell(label: String, value: String, mod: Modifier) {
     }
 }
 
-/** 记账星期条：本周7天，选中高亮，点选切换（类似待办周条） */
-@Composable
-private fun AccountWeekStrip(
-    shownDay: Calendar, today: Calendar, weekAcc: List<Account>, onSelectDay: (Calendar) -> Unit,
-    dragFrac: () -> Float = { 0f }
-) {
-    // remember：跨周时 7 天全变，不记住会每帧重算 7 次 Calendar 拷贝 + 7 次 endOfDayMs
-    val start = remember(shownDay) { DateUtils.startOfWeek(shownDay) }
-    val days = remember(start) { (0..6).map { DateUtils.addDays(start, it) } }
-    val selIdx = remember(days, shownDay) {
-        days.indexOfFirst { DateUtils.isSameDay(it, shownDay) }.coerceAtLeast(0)
-    }
-    // 每天是否有账目：按「天毫秒」建一次 Set，避免每格都对 weekAcc 扫一遍（7×N）
-    val dayKeysWithAcc = remember(weekAcc) {
-        weekAcc.map { DateUtils.startOfDayMs(it.date) }.toHashSet()
-    }
-    val circle = 32.dp
-    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
-        // 星期几单独一行（显式行高，红圆纵坐标才是确定的）
-        Row(Modifier.fillMaxWidth()) {
-            days.forEach { d ->
-                Text(DateUtils.weekdayShortCn(d), fontSize = 11.sp, lineHeight = 15.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center,
-                    modifier = Modifier.weight(1f))
-            }
-        }
-        BoxWithConstraints(Modifier.fillMaxWidth()) {
-            val colPx = constraints.maxWidth / 7f
-            val circlePx = with(LocalDensity.current) { circle.toPx() }
-            // 选中圆整条共用一枚，横向位置 =（选中格 - 手指进度）——「手往左 = 下一天」，
-            // 下一天在右边，所以圆朝新进来的那天滑。进度在布局阶段读，拖动时不重组。
-            Box(
-                Modifier
-                    .offset {
-                        val x = (selIdx - dragFrac()) * colPx + (colPx - circlePx) / 2f
-                        IntOffset(x.roundToInt(), 0)
-                    }
-                    .size(circle)
-                    .background(MaterialTheme.colorScheme.primary, CircleShape)
-            )
-            Row(Modifier.fillMaxWidth()) {
-                days.forEachIndexed { i, d ->
-                    val isToday = DateUtils.isSameDay(d, today)
-                    val hasAcc = DateUtils.startOfDayMs(d.timeInMillis) in dayKeysWithAcc
-                    Column(Modifier.weight(1f).clickable { onSelectDay(d) }, horizontalAlignment = Alignment.CenterHorizontally) {
-                        Box(Modifier.size(circle).background(
-                            if (isToday && i != selIdx) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)
-                            else Color.Transparent, CircleShape), contentAlignment = Alignment.Center) {
-                            // 数字画两层：常态色 + 白字（白字层按被红圆盖住的程度淡入，避免穿帮）。
-                            // lineHeight 显式给 21sp（= 字号 14 × 字体自身行高 1.48）：
-                            // 不给会继承主题 24sp 行高，多出的空白把数字在圆里顶低约 2dp、看着不居中。
-                            val num = "${d.get(Calendar.DAY_OF_MONTH)}"
-                            val weight = if (isToday) FontWeight.Bold else FontWeight.Normal
-                            Text(num, fontSize = 14.sp, lineHeight = 21.sp, fontWeight = weight,
-                                color = MaterialTheme.colorScheme.onSurface)
-                            Text(num, fontSize = 14.sp, lineHeight = 21.sp, fontWeight = weight,
-                                color = Color.White,
-                                modifier = Modifier.graphicsLayer {
-                                    alpha = (1f - abs(i - (selIdx - dragFrac()))).coerceIn(0f, 1f)
-                                })
-                        }
-                        // 和待办周条一致：小红点与日期圆之间留 5dp
-                        Box(Modifier.padding(top = 5.dp).size(4.dp).background(
-                            if (hasAcc) MaterialTheme.colorScheme.primary else Color.Transparent, CircleShape))
-                    }
-                }
-            }
-        }
-    }
-}
-
-/** 记账 / 修改账目共用的弹窗：金额 → 收支 → 备注 → 标签 → 日期 */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AccountEditSheet(
     tags: List<AccTagEntity>,
@@ -760,90 +663,100 @@ private fun AccountEditSheet(
      * 确定性地在 TextField 那次定位之后、同一帧内生效，不依赖帧数。
      */
 
-    AlertDialog(
-            shape = GlassDialogShape,
-            containerColor = glassDialogContainer(),
-            modifier = glassDialogModifier(),
+    ShixuDialog(
+        title = if (editing == null) "记一笔" else "修改账目",
         onDismissRequest = onDismiss,
-        title = { Text(if (editing == null) "记一笔" else "修改账目", fontWeight = FontWeight.Bold) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(value = amountV, onValueChange = { amountV = it; error = null },
-                    label = { Text("金额") }, singleLine = true,
-                    isError = error != null,
-                    supportingText = error?.let { { Text(it, fontSize = 11.sp) } },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth().focusRequester(amountFocus)
-                        .jumpCursorToEnd({ amountV }) { amountV = it })
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = !isIncome, onClick = { isIncome = false }, label = { Text("支出") })
-                    FilterChip(selected = isIncome, onClick = { isIncome = true }, label = { Text("收入") })
+        content = {
+            OutlinedTextField(
+                value = amountV, onValueChange = { amountV = it; error = null },
+                label = { Text("金额") }, singleLine = true,
+                isError = error != null,
+                textStyle = MaterialTheme.typography.bodyMedium,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                // 千万别给这个输入框指定高度：M3 带标签的 OutlinedTextField 按字体度量留字身空间，
+                // 本 App 的 songti_sc 字体 ascent=1.06em / descent=0.435em，自然高度是 64dp（非规范的 56dp）。
+                // 压得比自然高度小，文本行就会在字段内部被裁掉下半截（2026-10-16 实测：52dp 只剩 20px 笔画、
+                // 56dp 剩 31px、60dp 剩 42px，而 "ABpgqy" 完整字形是 43px）。
+                modifier = Modifier.fillMaxWidth()
+                    .focusRequester(amountFocus)
+                    .jumpCursorToEnd({ amountV }) { amountV = it })
+            // 错误提示单独占一行（自带 6dp 行距），不走 TextField 的 supportingText：
+            // supportingText 会常驻给字段再加一段固定高度，而单独一行只在出错时才出现、弹窗自然长高。
+            // （另外，早前输入框高度被压到 52dp 时 supportingText 也曾被裁掉下半截，
+            //   实测只剩 13px 笔画、正常是 28px —— 同一个"压高度"坑，现输入框已不指定高度。）
+            error?.let {
+                Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ShixuChip(selected = !isIncome, onClick = { isIncome = false }, compact = true,
+                    label = { Text("支出") })
+                ShixuChip(selected = isIncome, onClick = { isIncome = true }, compact = true,
+                    label = { Text("收入") })
+            }
+            if (showNote) {
+                OutlinedTextField(
+                    value = titleV, onValueChange = { titleV = it },
+                    label = { Text("备注") }, singleLine = true,
+                    textStyle = MaterialTheme.typography.bodyMedium,
+                    // 同上：不要指定高度，否则文字下半截被裁
+                    modifier = Modifier.fillMaxWidth()
+                        .jumpCursorToEnd({ titleV }) { titleV = it })
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    Text("收起 ▴", fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.clickable { showNote = false }
+                            .padding(horizontal = 6.dp))
                 }
-                if (showNote) {
-                    OutlinedTextField(value = titleV, onValueChange = { titleV = it },
-                        label = { Text("备注") }, singleLine = true,
-                        modifier = Modifier.fillMaxWidth().jumpCursorToEnd({ titleV }) { titleV = it })
-                    // 备注区收尾：1px 分隔线 + 线下方右侧的「收起」（原来嵌在输入框里，跟内容挤在一起）
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        Text("收起 ▴", fontSize = 12.5.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.clickable { showNote = false }
-                                .padding(horizontal = 6.dp, vertical = 4.dp))
-                    }
-                } else {
-                    TextButton(onClick = { showNote = true }, contentPadding = PaddingValues(0.dp)) {
-                        Text("＋ 备注", fontSize = 13.sp)
+            } else {
+                TextButton(onClick = { showNote = true }, contentPadding = PaddingValues(0.dp),
+                    modifier = Modifier.height(26.dp)) {
+                    Text("＋ 备注", fontSize = 13.sp)
+                }
+            }
+            if (tags.isNotEmpty()) {
+                Text("标签", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(tags, key = { it.id }) { t ->
+                        ShixuChip(
+                            selected = tag == t.name,
+                            onClick = { tag = if (tag == t.name) "" else t.name },
+                            compact = true,
+                            label = { Text(t.name, fontSize = 13.sp) },
+                            leadingIcon = {
+                                Box(Modifier.size(10.dp).background(Color(t.color.toInt()), CircleShape))
+                            }
+                        )
                     }
                 }
-                if (tags.isNotEmpty()) {
-                    Text("标签", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        items(tags, key = { it.id }) { t ->
-                            FilterChip(
-                                selected = tag == t.name,
-                                onClick = { tag = if (tag == t.name) "" else t.name },
-                                label = { Text(t.name) },
-                                leadingIcon = {
-                                    Box(Modifier.size(10.dp).background(Color(t.color.toInt()), CircleShape))
-                                }
-                            )
-                        }
-                    }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.height(38.dp)) {
+                Text("日期", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f))
+                Box(Modifier.size(32.dp).clip(RoundedCornerShape(8.dp))
+                    .clickable { dateMs = DateUtils.addDays(dateCal, -1).timeInMillis },
+                    contentAlignment = Alignment.Center) {
+                    Text("‹", fontSize = 20.sp, color = MaterialTheme.colorScheme.primary)
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("日期", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.weight(1f))
-                    Box(Modifier.size(34.dp).clip(RoundedCornerShape(8.dp))
-                        .clickable { dateMs = DateUtils.addDays(dateCal, -1).timeInMillis },
-                        contentAlignment = Alignment.Center) {
-                        Text("‹", fontSize = 20.sp, color = MaterialTheme.colorScheme.primary)
-                    }
-                    Text(DateUtils.formatMonthDayCn(dateCal), fontSize = 15.sp,
-                        modifier = Modifier.padding(horizontal = 6.dp))
-                    Box(Modifier.size(34.dp).clip(RoundedCornerShape(8.dp))
-                        .clickable { dateMs = DateUtils.addDays(dateCal, 1).timeInMillis },
-                        contentAlignment = Alignment.Center) {
-                        Text("›", fontSize = 20.sp, color = MaterialTheme.colorScheme.primary)
-                    }
+                Text(DateUtils.formatMonthDayCn(dateCal), fontSize = 15.sp,
+                    modifier = Modifier.padding(horizontal = 6.dp))
+                Box(Modifier.size(32.dp).clip(RoundedCornerShape(8.dp))
+                    .clickable { dateMs = DateUtils.addDays(dateCal, 1).timeInMillis },
+                    contentAlignment = Alignment.Center) {
+                    Text("›", fontSize = 20.sp, color = MaterialTheme.colorScheme.primary)
                 }
             }
         },
         confirmButton = {
-            Button(
-                onClick = {
-                    val cents = parseYuanToCents(amount)
-                    if (cents == null) {
-                        error = "请输入有效金额（最多两位小数）"
-                    } else {
-                        onSave(title.trim(), cents, tag, isIncome, dateMs)
-                        onDismiss()
-                    }
-                },
-                shape = RoundedCornerShape(50),
-                contentPadding = PaddingValues(horizontal = 26.dp, vertical = 10.dp)
-            ) { Text("保存") }
+            ShixuDialogButton("保存") {
+                val cents = parseYuanToCents(amount)
+                if (cents == null) {
+                    error = "请输入有效金额（最多两位小数）"
+                } else {
+                    onSave(title.trim(), cents, tag, isIncome, dateMs)
+                    onDismiss()
+                }
+            }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+        dismissButton = { ShixuDialogTextButton("取消", onDismiss) }
     )
 }

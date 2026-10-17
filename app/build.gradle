@@ -20,8 +20,8 @@ android {
         applicationId "com.rongyu.shixuji"
         minSdk 24
         targetSdk 34
-        versionCode 517
-        versionName "5.1.0"
+        versionCode 528
+        versionName "5.2.3"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -42,6 +42,10 @@ android {
         }
     }
     compileOptions {
+        // 统一周条组件（ui/motion）用 java.time.LocalDate 做日期几何：
+        // minSdk 24 < 26，java.time 在 Android 8.0 以下不存在，必须开脱糖。
+        // 顺带附带 DST 正确性：按「日历天数」而不是「毫秒差 ÷ 86400000」算天数差。
+        coreLibraryDesugaringEnabled true
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
@@ -88,6 +92,13 @@ dependencies {
     // FileProvider + ShareCompat（「分享备份」走系统分享面板）
     implementation 'androidx.core:core-ktx:1.13.1'
 
-    // 单元测试（纯逻辑：金额换算 / 日期计算）
+    // 单元测试（纯逻辑：金额换算 / 日期计算 / 周条几何 / 备份文件解析）
     testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.jetbrains.kotlin:kotlin-test-junit:2.0.21'
+    // 备份解析（data/BackupCodec.kt）用 org.json：android.jar 里那份在 JVM 单测中是空壳
+    // （所有方法都返回 null/抛 not mocked），拉一份真 jar 进来才能离线跑恢复逻辑的回归测试。
+    testImplementation 'org.json:json:20240303'
+
+    // java.time 脱糖（配合 compileOptions.coreLibraryDesugaringEnabled）
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
 }

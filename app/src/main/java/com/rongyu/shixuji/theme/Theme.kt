@@ -53,7 +53,9 @@ private val LightColors = lightColorScheme(
     surfaceContainer = Color.White.copy(alpha = 0.58f),
     surfaceContainerHigh = Color.White.copy(alpha = 0.72f),
     surfaceContainerHighest = Color.White.copy(alpha = 0.82f),
-    outline = Color.White.copy(alpha = 0.72f),
+    // 未选中描边（勾选框 / 开关 / 单选圈 / 芯片）：原「白色 72%」在浅色卡上看不见，
+    // 用户 2026-10-16 要求改成与主题淡红相近 —— 同色系、但比主线红淡，仍是"框"而不是"块"
+    outline = Accent.copy(alpha = 0.42f),
     outlineVariant = Color(0x1F000000),
     error = Accent,
     scrim = Color(0x66000000)
@@ -77,7 +79,7 @@ private val DarkColors = darkColorScheme(
     surfaceContainer = Color.White.copy(alpha = 0.11f),
     surfaceContainerHigh = Color.White.copy(alpha = 0.16f),
     surfaceContainerHighest = Color.White.copy(alpha = 0.20f),
-    outline = Color.White.copy(alpha = 0.20f),
+    outline = AccentDark.copy(alpha = 0.55f),   // 深色：同上，改成亮红描边
     outlineVariant = Color(0x33FFFFFF),
     error = AccentDark,
     scrim = Color(0x99000000)

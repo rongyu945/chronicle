@@ -47,8 +47,6 @@ interface TodoDao {
     @Query("UPDATE todos SET priority = :priority WHERE id = :id") suspend fun setPriority(id: Long, priority: Int)
     @Query("UPDATE todos SET sortOrder = :order WHERE id = :id") suspend fun setSortOrder(id: Long, order: Int)
     @Query("SELECT * FROM todos WHERE id = :id") suspend fun getById(id: Long): Todo?
-    /** 下一条自增 id：Room 的 @Insert 不返回 RowId，插入前自己取一下（撤回新增要用 id） */
-    @Query("SELECT COALESCE(MAX(id), 0) + 1 FROM todos") suspend fun nextId(): Long
     /**
      * 全表最小的手动顺序值：新增待办时取它再减 1，让新条目**恒排在最上面**
      * （用户 2026-10-14：新建的就放最上面）。数据库顺序才是列表顺序的来源，
@@ -93,8 +91,6 @@ interface AccountDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsert(account: Account): Long
     @Query("DELETE FROM accounts WHERE id = :id") suspend fun delete(id: Long)
     @Query("SELECT * FROM accounts WHERE id = :id") suspend fun getById(id: Long): Account?
-    /** 下一条自增 id（撤回「新增」要按 id 删） */
-    @Query("SELECT COALESCE(MAX(id), 0) + 1 FROM accounts") suspend fun nextId(): Long
     @Query("UPDATE accounts SET title = :title, amountCents = :cents, type = :type, tag = :tag, date = :date WHERE id = :id")
     suspend fun update(id: Long, title: String, cents: Long, type: Int, tag: String, date: Long)
     @Query("SELECT * FROM accounts ORDER BY date DESC") fun observeAll(): Flow<List<Account>>
@@ -184,6 +180,12 @@ interface AppPrefDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun put(pref: AppPref)
     @Query("SELECT value FROM app_prefs WHERE `key` = :key") suspend fun get(key: String): String?
     @Query("SELECT * FROM app_prefs") fun observeAll(): Flow<List<AppPref>>
+
+    /**
+     * 恢复备份时把「界面设置」整组抹掉重写用（见 SettingsViewModel.restoreFromJson）。
+     * 只传给它的都是界面设置键，不含 loop_week 这类内部状态 —— 内部状态不该被备份覆盖。
+     */
+    @Query("DELETE FROM app_prefs WHERE `key` IN (:keys)") suspend fun removeAll(keys: List<String>)
 }
 
 @Database(
@@ -193,6 +195,18 @@ interface AppPrefDao {
 )
 abstract class AppDatabase : RoomDatabase() {
     companion object {
+        /**
+         * 备份文件里「界面设置」对应的偏好键名。恢复时这一组是**整组替换**：
+         * 先删掉这五个键，再写入文件里带的那些。
+         *
+         * 为什么不是「只覆盖文件里带的键」：文件里没有 font_scale，可能有两种意思 ——
+         * 「导出时没设过字号」或「这版 App 还没有字号功能」。前者应当恢复成默认字号，
+         * 后者不该动当前值。既然分不清，就按「备份 = 那一刻的完整状态」来理解：
+         * 这一组一律以备份为准，备份里没有 = 回到默认。这条组里不含 loop_week
+         * 这类内部状态（它不是"设置"，被覆盖会让循环待办提前/延后一周清零）。
+         */
+        val PREF_KEYS = listOf("budget_month", "font_scale", "songti", "dark", "tab_order")
+
         /**
          * 当前数据库版本。**改 @Database(version = ...) 时必须同步改这里** —— 备份文件靠它
          * 记录"这份数据来自哪一版"，恢复时才知道字段够不够。之所以另存一个常量而不是读
