@@ -103,28 +103,55 @@ interface AccountDao {
     /** 删除标签时把用到它的账目标签清空，避免留下"孤儿标签" */
     @Query("UPDATE accounts SET tag = '' WHERE tag = :name") suspend fun clearTag(name: String)
     @Query("SELECT COUNT(*) FROM accounts WHERE tag = :name") suspend fun countByTag(name: String): Int
+    /**
+     * 某个时间点之后各标签的记账次数（记账弹窗里「标签按最近 30 天最常用排序」用）。
+     * 用 tag 聚合比先 getAll() 再在 Kotlin 里 groupingBy 省一次整表搬运。
+     */
+    @Query("SELECT tag AS tag, COUNT(*) AS cnt FROM accounts WHERE tag != '' AND date >= :since GROUP BY tag")
+    suspend fun countByTagSince(since: Long): List<TagCount>
     @Query("SELECT * FROM accounts") suspend fun getAll(): List<Account>
     @Query("DELETE FROM accounts") suspend fun clear()
 }
 
-// ===== 循环待办（每周几固定出现） =====
+// ===== 循环待办（按间隔天数循环出现） =====
+/**
+ * 循环待办：5.5.0 起不再按「每周几」，改成**两个日期推间隔**。
+ *
+ *  - [startDate]   提醒开始日期（当天 00:00）。用来定间隔的下限：早于这天的日子不算。
+ *  - [nextDate]    下一次提醒日期（当天 00:00）。序列就是「以它为锚，每 [intervalDays] 天一次」。
+ *  - [intervalDays] 间隔天数，保存时由 `(nextDate - startDate)` 推出来并固化 ——
+ *                  固化是必须的：日子往后走时会把 nextDate 往前推一个或多个间隔，
+ *                  若每次再拿两个日期反算，间隔会翻倍（第 2 次提醒后变成 2N 天）。
+ *  - [doneDates]   勾掉过的提醒日（epochDay 逗号串，只留最近若干条）。
+ *                  按「哪一天」记录而不是一个全局布尔：间隔可以是 3 天也可以是 20 天，
+ *                  没有「这一周」这种概念，布尔标记既会串天也无法回溯。
+ */
 @Entity(tableName = "loop_todos")
 data class LoopTodo(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val title: String,
     val detail: String = "",
-    val dayOfWeek: Int,          // 1..7 (周一=1 ... 周日=7), 按需求每周几循环
-    val doneThisWeek: Boolean = false
+    val startDate: Long = 0L,
+    val nextDate: Long = 0L,
+    val intervalDays: Int = 7,
+    val doneDates: String = "",
 )
 
 @Dao
 interface LoopTodoDao {
     @Insert suspend fun insert(t: LoopTodo): Long
+    @Query("UPDATE loop_todos SET title = :title, detail = :detail, startDate = :startDate, " +
+        "nextDate = :nextDate, intervalDays = :intervalDays WHERE id = :id")
+    suspend fun update(id: Long, title: String, detail: String,
+                       startDate: Long, nextDate: Long, intervalDays: Int)
+    @Query("UPDATE loop_todos SET doneDates = :doneDates WHERE id = :id")
+    suspend fun setDoneDates(id: Long, doneDates: String)
+    /** 日子往前走之后把「下一次提醒」推到最近的一次（加的是整倍数间隔，序列本身不变） */
+    @Query("UPDATE loop_todos SET nextDate = :nextDate WHERE id = :id")
+    suspend fun setNextDate(id: Long, nextDate: Long)
     @Query("DELETE FROM loop_todos WHERE id = :id") suspend fun delete(id: Long)
-    @Query("UPDATE loop_todos SET doneThisWeek = :done WHERE id = :id") suspend fun setDone(id: Long, done: Boolean)
-    /** 进入新的一周时统一清零（否则"每周循环"永远只生效一次） */
-    @Query("UPDATE loop_todos SET doneThisWeek = 0") suspend fun resetAllDone()
-    @Query("SELECT * FROM loop_todos ORDER BY dayOfWeek ASC") fun observeAll(): Flow<List<LoopTodo>>
+    @Query("SELECT * FROM loop_todos ORDER BY nextDate ASC, id ASC") fun observeAll(): Flow<List<LoopTodo>>
+    @Query("SELECT * FROM loop_todos WHERE id = :id") suspend fun getById(id: Long): LoopTodo?
     @Query("SELECT * FROM loop_todos") suspend fun getAll(): List<LoopTodo>
     @Query("DELETE FROM loop_todos") suspend fun clear()
 }
@@ -165,6 +192,19 @@ interface QuickEntryDao {
     @Query("DELETE FROM quick_entries WHERE id = :id") suspend fun delete(id: Long)
     @Query("SELECT * FROM quick_entries ORDER BY sortOrder ASC, id ASC") fun observeAll(): Flow<List<QuickEntry>>
     @Query("SELECT * FROM quick_entries") suspend fun getAll(): List<QuickEntry>
+
+    /**
+     * 标签改名 / 删除时要同步这里。
+     *
+     * 常用记账存的是**标签名字符串**（不是 acc_tags 的外键），所以标签管理里改名或删标签
+     * 只要不同步这张表，快捷记账写出来的账目就会带一个已经不存在的标签名 ——
+     * 账目页显示灰点、支出饼图里多出一档灰的「孤儿标签」，看着像标签没删掉。
+     */
+    @Query("UPDATE quick_entries SET tag = :newName WHERE tag = :oldName")
+    suspend fun renameTag(oldName: String, newName: String)
+    @Query("UPDATE quick_entries SET tag = '' WHERE tag = :name")
+    suspend fun clearTag(name: String)
+
     @Query("DELETE FROM quick_entries") suspend fun clear()
 }
 
@@ -188,9 +228,12 @@ interface AppPrefDao {
     @Query("DELETE FROM app_prefs WHERE `key` IN (:keys)") suspend fun removeAll(keys: List<String>)
 }
 
+/** 标签使用次数（[AccountDao.countByTagSince] 的投影，列名必须与查询的别名一致） */
+data class TagCount(val tag: String, val cnt: Int)
+
 @Database(
     entities = [Todo::class, Account::class, LoopTodo::class, AccTagEntity::class, AppPref::class, QuickEntry::class],
-    version = 6,
+    version = 9,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -212,7 +255,7 @@ abstract class AppDatabase : RoomDatabase() {
          * 记录"这份数据来自哪一版"，恢复时才知道字段够不够。之所以另存一个常量而不是读
          * Room 运行时值，是因为导出备份的地方（SettingsViewModel）不该为了一个数字去碰数据库实例。
          */
-        const val DB_VERSION = 6
+        const val DB_VERSION = 9
     }
 
     abstract fun todoDao(): TodoDao

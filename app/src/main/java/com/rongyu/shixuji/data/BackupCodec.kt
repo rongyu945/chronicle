@@ -71,13 +71,13 @@ object BackupCodec {
         /** 恢复前给用户看的一句话概览 */
         fun summary(): String = buildString {
             append("待办 ${todos?.size ?: 0} 条 · 账目 ${accounts?.size ?: 0} 条")
-            append(" · 标签 ${accTags?.size ?: 0} 个 · 每周固定 ${loopTodos?.size ?: 0} 条")
+            append(" · 标签 ${accTags?.size ?: 0} 个 · 循环待办 ${loopTodos?.size ?: 0} 条")
             append(" · 常用记账 ${quickEntries?.size ?: 0} 个")
             val missing = buildList {
                 if (todos == null) add("待办")
                 if (accounts == null) add("账目")
                 if (accTags == null) add("标签")
-                if (loopTodos == null) add("每周固定")
+                if (loopTodos == null) add("循环待办")
                 if (quickEntries == null) add("常用记账")
             }
             if (missing.isNotEmpty()) append("（文件里没有${missing.joinToString("、")}这一段，恢复时不动它）")
@@ -132,15 +132,7 @@ object BackupCodec {
                     date = saneTs(num(o, "date")),
                 )
             }
-            val loops = section(root, "loopTodos", "每周固定") { o ->
-                LoopTodo(
-                    id = positive(num(o, "id")),
-                    title = text(o, "title"),
-                    detail = text(o, "detail"),
-                    dayOfWeek = num(o, "dayOfWeek").coerceIn(1L, 7L).toInt(),
-                    doneThisWeek = flag(o, "doneThisWeek"),
-                )
-            }
+            val loops = section(root, "loopTodos", "循环待办") { o -> loopOf(o) }
             val tags = section(root, "accTags", "标签") { o ->
                 AccTagEntity(
                     id = positive(num(o, "id")),
@@ -259,6 +251,49 @@ object BackupCodec {
         val v = num(o, key)
         if (v > MAX_CENTS || v < -MAX_CENTS) throw Corrupt("$label 的金额越界（$v 分）")
         return v
+    }
+
+    /**
+     * 一条循环待办。
+     *
+     * 新备份（5.5.0 起）直接有 startDate / nextDate / intervalDays / doneDates；
+     * 旧备份只有 dayOfWeek（每周几）—— 按「间隔 7 天」还原成两个日期：
+     * 下一次提醒 = 今天起最近的那个星期几（含今天），开始日期 = 它往前 7 天。
+     * 旧备份里的 doneThisWeek 无法定位到具体哪一天，只能丢掉那一个勾（不影响待办本身）。
+     */
+    private fun loopOf(o: JSONObject): LoopTodo {
+        val start = saneTs(num(o, "startDate"))
+        val next = saneTs(num(o, "nextDate"))
+        if (start > 0 && next > 0) {
+            // 间隔与两个日期对不上时以日期为准（间隔本来就是算出来的，字段可能是旧的）
+            return LoopTodo(
+                id = positive(num(o, "id")),
+                title = text(o, "title"),
+                detail = text(o, "detail"),
+                startDate = LoopSchedule.dayStart(start),
+                nextDate = LoopSchedule.dayStart(next),
+                intervalDays = LoopSchedule.intervalOf(start, next),
+                doneDates = text(o, "doneDates"),
+            )
+        }
+        val dow = num(o, "dayOfWeek").coerceIn(1L, 7L).toInt()
+        val cal = java.util.Calendar.getInstance()
+        val todayIso = if (cal.get(java.util.Calendar.DAY_OF_WEEK) == java.util.Calendar.SUNDAY) 7
+        else cal.get(java.util.Calendar.DAY_OF_WEEK) - 1
+        cal.add(java.util.Calendar.DAY_OF_MONTH, ((dow - todayIso + 7) % 7).toInt())
+        val nextMs = LoopSchedule.dayStart(cal.timeInMillis)
+        val startMs = (java.util.Calendar.getInstance().apply {
+            timeInMillis = nextMs; add(java.util.Calendar.DAY_OF_MONTH, -7)
+        }).timeInMillis
+        return LoopTodo(
+            id = positive(num(o, "id")),
+            title = text(o, "title"),
+            detail = text(o, "detail"),
+            startDate = startMs,
+            nextDate = nextMs,
+            intervalDays = 7,
+            doneDates = "",
+        )
     }
 
     private fun positive(v: Long): Long = if (v > 0) v else 0

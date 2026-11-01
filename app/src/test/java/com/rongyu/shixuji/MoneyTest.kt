@@ -5,7 +5,9 @@ import com.rongyu.shixuji.ui.formatCents
 import com.rongyu.shixuji.ui.parseYuanToCents
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Locale
 
 /**
  * 金额换算的回归测试。
@@ -60,6 +62,41 @@ class MoneyTest {
         listOf("0.29", "1.15", "8.87", "99.99", "1000.00").forEach { s ->
             val cents = parseYuanToCents(s)!!
             assertEquals(s, centsToYuanString(cents))
+        }
+    }
+
+    /**
+     * 边界值：老实现用 kotlin.math.abs(cents)，Long.MIN_VALUE 取绝对值还是负数（补码溢出），
+     * 会打印出 "-¥-92233720368547758.08" 这种负的金额主体。
+     */
+    @Test
+    fun 金额极端值不会出现负的主体() {
+        assertEquals("¥0.00", formatCents(0))
+        assertEquals("-¥0.01", formatCents(-1))
+        assertEquals("¥1.00", formatCents(100))
+        assertEquals("-¥1.00", formatCents(-100))
+        assertEquals("¥92233720368547758.07", formatCents(Long.MAX_VALUE))
+        assertEquals("-¥92233720368547758.08", formatCents(Long.MIN_VALUE))
+        // 每个数字都以数字符号开头（借「正/负号后面紧跟货币符号」验证主体不是负数）
+        listOf(0L, 1L, -1L, 99L, -99L, Long.MAX_VALUE, Long.MIN_VALUE).forEach {
+            val s = formatCents(it)
+            assertTrue("$it → $s 主体里出现了第二个负号", s.count { c -> c == '-' } <= 1)
+        }
+    }
+
+    /** 金额显示不能跟着系统语言变：阿拉伯语等「本地数字形」语言下 %d 会输出 ٩٢٣ */
+    @Test
+    fun 金额显示不受系统语言影响() {
+        val old = Locale.getDefault()
+        try {
+            Locale.setDefault(Locale.forLanguageTag("ar-EG"))
+            assertEquals("¥12.34", formatCents(1234))
+            assertEquals("-¥0.07", formatCents(-7))
+            assertEquals("-¥92233720368547758.08", formatCents(Long.MIN_VALUE))
+            Locale.setDefault(Locale.forLanguageTag("hi-IN"))
+            assertEquals("¥12.34", formatCents(1234))
+        } finally {
+            Locale.setDefault(old)
         }
     }
 }

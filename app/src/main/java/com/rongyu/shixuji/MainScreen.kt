@@ -25,6 +25,7 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.room.withTransaction
 import com.rongyu.shixuji.data.AppPref
+import com.rongyu.shixuji.data.LoopSchedule
 import com.rongyu.shixuji.theme.BgLight
 import com.rongyu.shixuji.theme.ShixuJiTheme
 import com.rongyu.shixuji.ui.*
@@ -91,21 +92,24 @@ fun MainScreen(initialPrefs: Map<String, String>? = null) {
     var splashDone by remember { mutableStateOf(!isSplashTime) }
 
     /**
-     * 循环待办按周清零 + 写周戳：两件事必须在**同一个事务**里。
+     * 循环待办：把「下一次提醒」追到今天。
      *
-     * 拆成两次独立写入时，中间被中断（进程被杀 / 崩溃）会留下
-     * 「已清零但周戳没写」→ 下次启动又清一遍（还只是重复劳动）；
-     * 若顺序反过来（先写周戳再清零）中断就变成「整周都不再清零」——
-     * 用户看到的是「每周循环的待办这周怎么不出现了」。放一个事务里就都不会发生。
+     * 5.5.0 起循环待办不再按「每周几」+ 每周清零，而是「开始日期 + 下一次提醒日期」推出间隔、
+     * 之后按间隔成序列出现。日子走过之后要把 nextDate 推到最近的一次 ——
+     * 推的是**整倍数间隔**，所以提醒日序列不变、已勾选的记录也不会错位。
+     *
+     * 没有直接算好日期再查库，而是每次启动/每分钟扫一遍（条数是个位数），
+     * 免得「App 开着跨过零点」那天该出现的提醒不出现（旧版靠 60s 轮询兜过同类问题）。
      *
      * 注意：局部函数必须声明在使用之前（Kotlin 不允许在前面的 lambda 里引用后面的局部函数）。
      */
-    suspend fun resetLoopIfNewWeek() {
-        val thisWeek = DateUtils.startOfWeek(DateUtils.todayCal()).timeInMillis.toString()
+    suspend fun advanceLoops() {
+        val today = DateUtils.startOfToday().timeInMillis
+        val all = loopDao.getAll()
+        if (all.isEmpty()) return
         AppContainer.database.withTransaction {
-            if (prefDao.get("loop_week") != thisWeek) {
-                loopDao.resetAllDone()
-                prefDao.put(AppPref("loop_week", thisWeek))
+            all.forEach { l ->
+                LoopSchedule.advanceNext(l, today)?.let { next -> loopDao.setNextDate(l.id, next) }
             }
         }
     }
@@ -116,7 +120,7 @@ fun MainScreen(initialPrefs: Map<String, String>? = null) {
         prefDao.get("dark")?.let { isDark = when (it) { "1" -> true; "0" -> false; else -> null } }
         prefDao.get("font_scale")?.let { s -> s.toFloatOrNull()?.let { fontScale = it } }
         prefDao.get("tab_order")?.let { raw -> parseTabOrder(raw)?.let { tabOrder = it } }
-        resetLoopIfNewWeek()
+        advanceLoops()
         loaded = true
     }
 
@@ -132,10 +136,14 @@ fun MainScreen(initialPrefs: Map<String, String>? = null) {
         prefDao.observeAll().collect { rows ->
             if (first) { first = false; return@collect }
             val m = rows.associate { it.key to it.value }
-            m["songti"]?.let { isSongti = it == "1" }
-            m["dark"]?.let { d -> isDark = when (d) { "1" -> true; "0" -> false; else -> null } }
-            m["font_scale"]?.let { s -> s.toFloatOrNull()?.let { fontScale = it } }
-            m["tab_order"]?.let { raw -> parseTabOrder(raw)?.let { tabOrder = it } }
+            // ⚠️ 这几行必须**带默认值**（缺键 = 回默认），不能只在键存在时才赋值：
+            //    恢复备份时会先把 PREF_KEYS 整组删掉再写文件里带的项 —— 文件里没写 dark/songti 等
+            //    就表示「那一刻是默认外观」。只在键存在时赋值的写法会让旧值留下来，
+            //    与「备份 = 那一刻的完整状态」的约定相反（用户看到的是恢复了备份、外观却没变）。
+            isSongti = m["songti"]?.let { it == "1" } ?: true
+            isDark = when (m["dark"]) { "1" -> true; "0" -> false; else -> null }
+            fontScale = m["font_scale"]?.toFloatOrNull() ?: 1.0f
+            tabOrder = m["tab_order"]?.let { raw -> parseTabOrder(raw) } ?: DEFAULT_TAB_ORDER
         }
     }
 
@@ -159,8 +167,8 @@ fun MainScreen(initialPrefs: Map<String, String>? = null) {
             kotlinx.coroutines.delay(60_000)
             val now = DateUtils.todayCal().timeInMillis
             if (now != todayTick) todayTick = now
-            // 循环待办按周重置：不只靠启动时那一次，App 一直挂后台跨过周一也要清零
-            resetLoopIfNewWeek()
+            // 循环待办把「下一次提醒」追到今天：不只靠启动时那一次，App 一直挂着跨过零点也要追
+            advanceLoops()
         }
     }
 

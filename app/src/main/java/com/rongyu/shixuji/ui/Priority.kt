@@ -17,8 +17,8 @@ fun priorityLabel(p: Int): String = when (p) {
 
 /** 优先级色条颜色（传入当前是否深色，红在深色下提亮） */
 fun priorityColor(p: Int, isDark: Boolean): Color = when (p) {
-    PRIORITY_HIGH -> if (isDark) Color(0xFFFF6B61) else Color(0xFFFF3B30)
-    PRIORITY_MID -> if (isDark) Color(0xFFFFB340) else Color(0xFFFF9F0A)
-    PRIORITY_LOW -> if (isDark) Color(0xFF7EA6D8) else Color(0xFF8E8E93)
+    PRIORITY_HIGH -> if (isDark) Color(0xFFF05654) else Color(0xFFED5736)   // 银红 / 妃色
+    PRIORITY_MID -> if (isDark) Color(0xFFFFC773) else Color(0xFFFFA631)    // 姜黄 / 杏黄
+    PRIORITY_LOW -> if (isDark) Color(0xFF7397AB) else Color(0xFF75878A)    // 苍青 / 苍色
     else -> Color.Transparent
 }

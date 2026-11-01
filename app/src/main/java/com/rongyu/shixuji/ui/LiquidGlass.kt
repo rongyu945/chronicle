@@ -298,7 +298,7 @@ fun Modifier.liquidGlass(
             // 整圈 1px 淡描边
             drawRoundRect(
                 color = if (dark) Color.White.copy(alpha = 0.14f)
-                else Color(0xFF5A4B96).copy(alpha = 0.16f),
+                else Color(0xFF574266).copy(alpha = 0.16f),
                 topLeft = Offset(si, si),
                 size = Size(
                     (size.width - si * 2f).coerceAtLeast(0f),

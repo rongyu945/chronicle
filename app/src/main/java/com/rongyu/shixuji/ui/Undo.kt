@@ -7,9 +7,11 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -30,7 +32,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 
 /**
- * 底部黑色提示条控制器。
+ * 底部提示条控制器。
  *
  * 两种形态：
  *  - [show]     可撤回（删除 / 修改 / 新增…），右侧固定给「撤回」
@@ -87,7 +89,16 @@ class UndoController {
 @Composable
 fun rememberUndoController(): UndoController = remember { UndoController() }
 
-/** 底部黑色提示条（5 秒后自动消失） */
+/**
+ * 底部提示条（5 秒后自动消失）。
+ *
+ * 2026-10-25 用户要求：「撤回的条目的左右长度收窄，黑色的透明度增加，不要黑色要灰色」——
+ * 原来是一条 90% 黑、左右只留 16dp 边距、几乎占满屏宽的硬黑条，压在浅色界面上很像系统报错。
+ * 现在：
+ *  - **宽度跟着内容走**（最大 300dp，居中），短文案就是一小颗，不再横贯全屏；
+ *  - 底色改成中性灰 #515157（不再是纯黑），透明度 0.85 —— 比原来的 0.90 更透一点，
+ *    同时保证白字在这层灰上仍有 ~5:1 对比度（再透就看不清了）。
+ */
 @Composable
 fun UndoHost(ctrl: UndoController, modifier: Modifier = Modifier) {
     // 用 token 当 key（不是 message）：同一句话连续弹两次也要重新计时
@@ -103,35 +114,37 @@ fun UndoHost(ctrl: UndoController, modifier: Modifier = Modifier) {
         exit = slideOutVertically { it } + fadeOut(),
         modifier = modifier
     ) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp)
-                .clip(RoundedCornerShape(14.dp))
-                .background(Color(0xE61C1C1E))
-                .padding(start = 16.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // 文字用 weight 吃「扣掉按钮之后」的剩余宽度 + 单行省略号：
-            // 长文案再也不会把右侧按钮挤出屏幕（用户报的「撤回有时有、有时没有」就是这么来的：
-            // 原来的文字没限宽，长标题会占满整条，按钮只剩 0 宽度被裁掉）。
-            Text(
-                ctrl.message ?: "", color = Color.White, fontSize = 13.5.sp,
-                maxLines = 1, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
-            // 有动作才画「撤回」，画了就一定完整可见（不参与宽度争夺）
-            if (ctrl.action != null) {
+        Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp), contentAlignment = Alignment.Center) {
+            Row(
+                Modifier.widthIn(max = 300.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF50616D).copy(alpha = 0.85f))
+                    .padding(start = 16.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // 文字**限宽 + 单行省略号**，不用 weight：weight 会让整行占满 max 宽度，
+                // 条子又变成一条横贯屏幕的长条（正是这次要收窄掉的东西）。
+                // 限到 210dp 既保证右侧「撤回」永远完整可见，又让整条跟着文案长短伸缩。
                 Text(
-                    "撤回", color = Color(0xFFFF8A80), fontSize = 13.5.sp,
-                    fontWeight = FontWeight.SemiBold, maxLines = 1,
-                    modifier = Modifier
-                        .clickable { ctrl.undo() }
-                        .padding(horizontal = 12.dp, vertical = 9.dp)
+                    ctrl.message ?: "", color = Color.White, fontSize = 13.5.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = 210.dp)
                 )
-            } else {
-                // 纯提示：右侧留一点内边距，别让文字贴着圆角
-                androidx.compose.foundation.layout.Spacer(
-                    Modifier.padding(horizontal = 10.dp)
-                )
+                // 有动作才画「撤回」，画了就一定完整可见（不参与宽度争夺）
+                if (ctrl.action != null) {
+                    Text(
+                        "撤回", color = Color(0xFFFFB3A7), fontSize = 13.5.sp,
+                        fontWeight = FontWeight.SemiBold, maxLines = 1,
+                        modifier = Modifier
+                            .clickable { ctrl.undo() }
+                            .padding(horizontal = 12.dp, vertical = 9.dp)
+                    )
+                } else {
+                    // 纯提示：右侧留一点内边距，别让文字贴着圆角
+                    androidx.compose.foundation.layout.Spacer(
+                        Modifier.padding(horizontal = 10.dp)
+                    )
+                }
             }
         }
     }

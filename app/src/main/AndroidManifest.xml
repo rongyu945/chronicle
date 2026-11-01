@@ -20,10 +20,12 @@
             </intent-filter>
         </activity>
 
-        <!-- 分享备份文件用：只暴露 cacheDir/backup_share/，不碰外部存储、不要任何权限 -->
+        <!-- 分享备份文件用：只暴露 cacheDir/backup_share/，不碰外部存储、不要任何权限。
+             authority 用 ${applicationId} 占位符，将来加 flavor / applicationIdSuffix 不会错配
+             （调用点也必须用 ctx.packageName + ".fileprovider"，别写死包名）。 -->
         <provider
             android:name="androidx.core.content.FileProvider"
-            android:authorities="com.rongyu.shixuji.fileprovider"
+            android:authorities="${applicationId}.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data

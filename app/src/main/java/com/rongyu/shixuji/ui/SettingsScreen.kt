@@ -16,6 +16,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.rememberScrollState
@@ -51,12 +53,16 @@ import com.rongyu.shixuji.DEFAULT_TAB_ORDER
 import com.rongyu.shixuji.FONT_SCALES
 import com.rongyu.shixuji.parseTabOrder
 import com.rongyu.shixuji.data.AccTagEntity
+import com.rongyu.shixuji.data.AutoBackup
+import com.rongyu.shixuji.data.BackupWriter
 import com.rongyu.shixuji.data.Account
 import com.rongyu.shixuji.data.AppDatabase
 import com.rongyu.shixuji.data.AppPref
 import com.rongyu.shixuji.data.BackupCodec
+import com.rongyu.shixuji.data.LoopSchedule
 import com.rongyu.shixuji.data.LoopTodo
 import com.rongyu.shixuji.data.QuickEntry
+import com.rongyu.shixuji.data.TagPalette
 import com.rongyu.shixuji.data.Todo
 import com.rongyu.shixuji.theme.*
 import kotlinx.coroutines.Dispatchers
@@ -74,15 +80,10 @@ import java.util.Calendar
  * 注意：颜色是**按值存进标签记录**的（AccTag.color），所以换色板不会改动已有标签的颜色；
  * 旧 12 色全部保留在新色板里（老标签进编辑器仍然能高亮出自己那一格）。
  */
-private val TAG_COLOR_GROUPS: List<Pair<String, List<Long>>> = listOf(
-    "红系" to listOf(0xFFFF3B30, 0xFFFF5F3C, 0xFFFF2D55, 0xFFD0021B),
-    "橙黄系" to listOf(0xFFFF9500, 0xFFFF9F0A, 0xFFFFD60A, 0xFFC9A227),
-    "绿系" to listOf(0xFF34C759, 0xFF8BC34A, 0xFF6B8E23, 0xFF0A5C3C),
-    "青蓝系" to listOf(0xFF30B0C7, 0xFF32ADE6, 0xFF1E9EF0, 0xFF5A6CF0),
-    "紫粉系" to listOf(0xFFAF52DE, 0xFF7C4DFF, 0xFFF06292, 0xFFD98880),
-    "中性系" to listOf(0xFF8E8E93, 0xFF2C2C2E, 0xFF8B6A4B, 0xFFD8C3A5)
-)
-private val TAG_COLORS: List<Long> = TAG_COLOR_GROUPS.flatMap { it.second }
+// 色板本体在 data/TagPalette.kt：那里是「CIELAB 最远点散布」选的 24 色（两两色差最小 26），
+// 迁移（AppContainer.MIGRATION_6_7）也引用同一份，改色板只需改一个地方。
+private val TAG_COLOR_GROUPS: List<Pair<String, List<Long>>> = TagPalette.ROWS
+private val TAG_COLORS: List<Long> = TagPalette.ALL
 
 /** 设置（按《时序集-设置详情页细节.md》：待办 / 账单 / 界面显示 / 数据 / 关于作者） */
 @Composable
@@ -137,7 +138,7 @@ fun SettingsScreen(
         ) {
 
             SectionCard("待办") {
-                NavRow("循环待办", "每周几循环") { page = "loop" }
+                NavRow("循环待办", "按间隔提醒") { page = "loop" }
                 NavRow("导出未完成待办", "复制文本") { page = "export" }
             }
             SectionCard("账单") {
@@ -179,6 +180,7 @@ fun SettingsScreen(
             }
             SectionCard("数据") {
                 NavRow("备份 / 恢复", "导出或导入全部数据") { page = "backup" }
+                NavRow("自动备份", "改动条目后自动更新") { page = "autobackup" }
             }
             SectionCard("关于作者") {
                 NavRow("作者", "戎昱") {}
@@ -214,8 +216,10 @@ private fun NavRow(label: String, value: String, onClick: () -> Unit = {}) {
         verticalAlignment = Alignment.CenterVertically) {
         Text(label, fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
         Text(value, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text("›", fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(start = 6.dp))
+        Box(Modifier.padding(start = 2.dp)) {
+            Chevron(ChevronDir.Right, size = 12.dp, stroke = 1.2.dp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }
 
@@ -244,9 +248,12 @@ private fun ColumnScope.SettingSubPage(
                 top = if (subCollapseT > 0.5f) 6.dp else 4.dp,
                 bottom = if (subCollapseT > 0.5f) 4.dp else 8.dp
             )) {
-            Text("‹", fontSize = if (subCollapseT > 0.5f) 20.sp else 26.sp,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.clickable { onBack() }.padding(end = 8.dp))
+            ChevronButton(
+                dir = ChevronDir.Left, onClick = onBack,
+                box = 34.dp, chevron = if (subCollapseT > 0.5f) 13.dp else 16.dp, stroke = 1.2.dp,
+                corner = 10.dp, shiftX = 5.dp, contentDescription = "返回",
+                modifier = Modifier.padding(end = 0.dp)
+            )
             Text(when (page) {
                 "loop" -> "循环待办"; "export" -> "导出未完成待办"
                 "tags" -> "标签管理"; "bills" -> "账单总览"
@@ -254,6 +261,7 @@ private fun ColumnScope.SettingSubPage(
                 "order" -> "底栏排序"
                 "budget" -> "月度预算"; "quick" -> "常用记账"
                 "backup" -> "备份 / 恢复"
+                "autobackup" -> "自动备份"
                 else -> "设置"
             }, fontSize = (20f - 6f * subCollapseT).sp, fontWeight = FontWeight.Bold)
         }
@@ -267,6 +275,7 @@ private fun ColumnScope.SettingSubPage(
             "tags" -> TagManagePage()
             "bills" -> BillsOverviewPage()
             "pie" -> ExpensePiePage()
+            "autobackup" -> AutoBackupPage()
             "order" -> TabOrderPage(tabOrder, onApplyOrder, onBack)
             "budget" -> BudgetPage()
             "quick" -> QuickEntryPage()
@@ -299,9 +308,27 @@ class SettingsViewModel : ViewModel() {
     fun addQuick(e: QuickEntry) = viewModelScope.launch { quickDao.insert(e) }
     fun deleteQuick(id: Long) = viewModelScope.launch { quickDao.delete(id) }
 
-    fun addLoop(title: String, dow: Int) = viewModelScope.launch { loopDao.insert(LoopTodo(title = title, dayOfWeek = dow)) }
-    fun toggleLoop(id: Long, done: Boolean) = viewModelScope.launch { loopDao.setDone(id, done) }
-    fun deleteLoop(id: Long) = viewModelScope.launch { loopDao.delete(id) }
+    // ===== 循环待办（5.5.0：开始日期 + 下一次提醒 → 间隔天数自动推算） =====
+    // 两个入口都先把日期归到当天零点再用（界面/备份传进来的可能是「当前时刻」），
+    // 间隔从两个日期现算 —— 用户改任一个日期，间隔立即跟着变，不需要再问一遍「几天一次」。
+    fun addLoop(title: String, detail: String, startDate: Long, nextDate: Long) =
+        viewModelScope.launch(Dispatchers.IO) {
+            val start = LoopSchedule.dayStart(startDate)
+            val next = LoopSchedule.dayStart(nextDate)
+            loopDao.insert(LoopTodo(title = title, detail = detail, startDate = start,
+                nextDate = next, intervalDays = LoopSchedule.intervalOf(start, next)))
+        }
+    fun updateLoop(id: Long, title: String, detail: String, startDate: Long, nextDate: Long) =
+        viewModelScope.launch(Dispatchers.IO) {
+            val start = LoopSchedule.dayStart(startDate)
+            val next = LoopSchedule.dayStart(nextDate)
+            loopDao.update(id, title, detail, start, next, LoopSchedule.intervalOf(start, next))
+        }
+    fun toggleLoop(id: Long, dayMs: Long, done: Boolean) = viewModelScope.launch(Dispatchers.IO) {
+        val loop = loopDao.getById(id) ?: return@launch
+        loopDao.setDoneDates(id, LoopSchedule.withDone(loop, dayMs, done))
+    }
+    fun deleteLoop(id: Long) = viewModelScope.launch(Dispatchers.IO) { loopDao.delete(id) }
 
     /** 新建标签：同名就直接改那一条的颜色，别插出两条一模一样的（列表里分不清） */
     fun addTag(name: String, color: Long) = viewModelScope.launch(Dispatchers.IO) {
@@ -317,7 +344,11 @@ class SettingsViewModel : ViewModel() {
      */
     fun updateTag(tag: AccTagEntity, newName: String, color: Long) = viewModelScope.launch(Dispatchers.IO) {
         AppContainer.database.withTransaction {
-            if (newName != tag.name) accountDao.renameTag(tag.name, newName)
+            if (newName != tag.name) {
+                accountDao.renameTag(tag.name, newName)
+                // 常用记账存的也是标签名字符串 —— 不改它，快捷记账会写出「孤儿标签」的账目
+                quickDao.renameTag(tag.name, newName)
+            }
             tagDao.update(tag.id, newName, color)
         }
     }
@@ -329,6 +360,8 @@ class SettingsViewModel : ViewModel() {
     fun deleteTag(tag: AccTagEntity) = viewModelScope.launch(Dispatchers.IO) {
         AppContainer.database.withTransaction {
             accountDao.clearTag(tag.name)
+            // 同上：常用记账里的同名标签一起清掉
+            quickDao.clearTag(tag.name)
             tagDao.delete(tag.id)
         }
     }
@@ -343,70 +376,11 @@ class SettingsViewModel : ViewModel() {
      */
     companion object { const val BACKUP_SCHEMA = BackupCodec.SCHEMA }
 
-    suspend fun buildBackupJson(): String = withContext(Dispatchers.IO) {
-        val root = JSONObject()
-        root.put("app", "时序集")
-        root.put("schema", BACKUP_SCHEMA)
-        root.put("exportedAt", System.currentTimeMillis())
-        // 数据库版本与 App 版本：恢复时用来判断"这份文件来自哪一版、字段够不够"
-        root.put("dbVersion", AppDatabase.DB_VERSION)
-        root.put("appVersion", BuildConfig.VERSION_NAME)
-
-        val todosArr = JSONArray()
-        todoDao.getAll().forEach { t ->
-            todosArr.put(JSONObject().apply {
-                put("id", t.id); put("title", t.title); put("detail", t.detail)
-                put("done", t.done); put("dueDate", t.dueDate); put("createdAt", t.createdAt)
-                // 这三个漏掉会静默丢数据：恢复后所有优先级变「无」、拖动顺序被打乱、
-                // 已完成分区的先后也丢了（早期版本确实漏了，这里补上）
-                put("priority", t.priority); put("sortOrder", t.sortOrder); put("doneAt", t.doneAt)
-            })
-        }
-        root.put("todos", todosArr)
-
-        val accArr = JSONArray()
-        accountDao.getAll().forEach { a ->
-            accArr.put(JSONObject().apply {
-                put("id", a.id); put("title", a.title); put("amountCents", a.amountCents)
-                put("type", a.type); put("tag", a.tag); put("date", a.date)
-            })
-        }
-        root.put("accounts", accArr)
-
-        val loopArr = JSONArray()
-        loopDao.getAll().forEach { l ->
-            loopArr.put(JSONObject().apply {
-                put("id", l.id); put("title", l.title); put("detail", l.detail)
-                put("dayOfWeek", l.dayOfWeek); put("doneThisWeek", l.doneThisWeek)
-            })
-        }
-        root.put("loopTodos", loopArr)
-
-        val tagArr = JSONArray()
-        tagDao.getAll().forEach { t ->
-            tagArr.put(JSONObject().apply {
-                put("id", t.id); put("name", t.name); put("color", t.color); put("icon", t.icon)
-            })
-        }
-        root.put("accTags", tagArr)
-
-        val quickArr = JSONArray()
-        quickDao.getAll().forEach { q ->
-            quickArr.put(JSONObject().apply {
-                put("id", q.id); put("title", q.title); put("amountCents", q.amountCents)
-                put("type", q.type); put("tag", q.tag); put("sortOrder", q.sortOrder)
-            })
-        }
-        root.put("quickEntries", quickArr)
-
-        prefDao.get("budget_month")?.let { root.put("pref_budget", it) }
-        prefDao.get("font_scale")?.let { root.put("pref_font_scale", it) }
-        prefDao.get("songti")?.let { root.put("pref_songti", it) }
-        prefDao.get("dark")?.let { root.put("pref_dark", it) }
-        prefDao.get("tab_order")?.let { root.put("pref_tab_order", it) }
-
-        root.toString(2)
-    }
+    /**
+     * 导出备份（整份 JSON）。拼装逻辑已抽到 data/BackupWriter —— 自动备份用的是同一份，
+     * 两边共用才不会出现「导出能读、自动备份读不回」的分叉。
+     */
+    suspend fun buildBackupJson(): String = withContext(Dispatchers.IO) { BackupWriter.buildJson() }
 
     /**
      * 检查一份备份文件（恢复前先看内容，不碰数据库）。
@@ -434,13 +408,29 @@ class SettingsViewModel : ViewModel() {
             is BackupCodec.Result.Bad -> return@withContext r.code
             is BackupCodec.Result.Ok -> r.data
         }
+        var written = 0
         try {
             AppContainer.database.withTransaction {
-                data.todos?.let { list -> todoDao.clear(); list.forEach { todoDao.insert(it) } }
-                data.accounts?.let { list -> accountDao.clear(); list.forEach { accountDao.insert(it) } }
-                data.loopTodos?.let { list -> loopDao.clear(); list.forEach { loopDao.insert(it) } }
-                data.accTags?.let { list -> tagDao.clear(); list.forEach { tagDao.upsert(it) } }
-                data.quickEntries?.let { list -> quickDao.clear(); list.forEach { quickDao.insert(it) } }
+                data.todos?.let { raw ->
+                    val list = dedupeById(raw) { it.id }
+                    todoDao.clear(); list.forEach { todoDao.insert(it) }; written += list.size
+                }
+                data.accounts?.let { raw ->
+                    val list = dedupeById(raw) { it.id }
+                    accountDao.clear(); list.forEach { accountDao.insert(it) }; written += list.size
+                }
+                data.loopTodos?.let { raw ->
+                    val list = dedupeById(raw) { it.id }
+                    loopDao.clear(); list.forEach { loopDao.insert(it) }; written += list.size
+                }
+                data.accTags?.let { raw ->
+                    val list = dedupeById(raw) { it.id }
+                    tagDao.clear(); list.forEach { tagDao.upsert(it) }; written += list.size
+                }
+                data.quickEntries?.let { raw ->
+                    val list = dedupeById(raw) { it.id }
+                    quickDao.clear(); list.forEach { quickDao.insert(it) }; written += list.size
+                }
                 // 界面设置整组替换；文件里一项设置都没有（老文件）就整组不动，免得把现有外观抹成默认
                 if (data.prefs.isNotEmpty()) {
                     prefDao.removeAll(AppDatabase.PREF_KEYS)
@@ -452,82 +442,201 @@ class SettingsViewModel : ViewModel() {
                     }
                 }
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // 协作取消（离开页面 / 进程收尾）不是「写库失败」：照常抛出。
+            // 老写法 catch (Exception) 会把取消也吞成 -4，用户看到「写库失败」其实只是被取消。
+            throw e
         } catch (e: Exception) {
+            // 走到这里事务已经回滚，库还是恢复前的样子；只把细节留给日志，界面仍报 -4。
+            android.util.Log.w("ShixuJi", "restore failed, transaction rolled back", e)
             return@withContext -4
         }
-        data.count
+        written
+    }
+
+    /**
+     * 去掉备份文件里**重复的记录 id**。
+     *
+     * 落库用的是 REPLACE / @Insert(REPLACE)：两条同 id 的记录会静默互相覆盖，
+     * 用户看到「说恢复了 87 条、实际只有 86 条」，手改过的备份更是无声丢记录。
+     * 这里保留重复 id 的**最后一条**（与 REPLACE 后写覆盖先写的语义一致），
+     * id ≤ 0 的记录（读不出来时被归一成 0）不参与去重，交给 Room 自增。
+     */
+    private fun <T> dedupeById(list: List<T>, idOf: (T) -> Long): List<T> {
+        if (list.size < 2) return list
+        val seen = HashSet<Long>()
+        val out = ArrayList<T>(list.size)
+        for (t in list.asReversed()) {
+            val id = idOf(t)
+            if (id <= 0L || seen.add(id)) out += t
+        }
+        out.reverse()
+        return out
     }
 }
 
 // ===== 循环待办 =====
+/**
+ * 循环待办页（5.5.0 改版）。
+ *
+ * 用户 2026-11-01：「不再是每周几提醒，而是设置提醒的开始日期、下一次提醒日期，
+ * 通过这两个数据自动推算出间隔几天提醒一次」。所以界面上只有两个日期，
+ * 「每 N 天」是**算出来的结果**（[LoopSchedule.intervalOf]），当场显示、不用用户再填一遍间隔。
+ * 改任一个日期，间隔立刻跟着变；下一次提醒早于开始日期时报红字，不许保存。
+ */
 @Composable
 private fun LoopTodoPage(vm: SettingsViewModel = viewModel()) {
     val loops by vm.loops.collectAsState(initial = emptyList())
-    var showAdd by remember { mutableStateOf(false) }
-    var deleteTarget by remember { mutableStateOf<LoopTodo?>(null) }
+    var editing by remember { mutableStateOf<LoopTodo?>(null) }     // null = 没开弹窗
+    var adding by remember { mutableStateOf(false) }
+    val today = remember { LoopSchedule.dayStart(System.currentTimeMillis()) }
 
     Column {
-        LabelText("每周固定出现的待办，勾选状态进入新的一周会自动重置", 13, MaterialTheme.colorScheme.onSurfaceVariant)
         loops.forEach { t ->
-            Card(Modifier.fillMaxWidth().padding(bottom = 8.dp),
+            val dueToday = LoopSchedule.isDueOn(t, today)
+            val done = LoopSchedule.isDoneOn(t, today)
+            Card(Modifier.fillMaxWidth().padding(bottom = 8.dp).clickable { editing = t },
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 shape = RoundedCornerShape(12.dp)) {
                 Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = t.doneThisWeek, onCheckedChange = { vm.toggleLoop(t.id, it) })
+                    // 今天不该提醒时不给勾选框（勾了也没有对应的「这一次」），只留个占位保持对齐
+                    if (dueToday) {
+                        Checkbox(checked = done, onCheckedChange = { vm.toggleLoop(t.id, today, it) })
+                    } else {
+                        Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                            Text("·", fontSize = 20.sp, color = MaterialTheme.colorScheme.outlineVariant)
+                        }
+                    }
                     Column(Modifier.weight(1f)) {
                         Text(t.title, fontSize = 15.sp)
-                        Text("每周${DateUtils.WEEK_CN[t.dayOfWeek - 1]}", fontSize = 12.sp,
+                        if (t.detail.isNotBlank()) {
+                            Text(t.detail, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Text(loopScheduleLine(t, today), fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Text("删", color = MaterialTheme.colorScheme.error, fontSize = 13.sp,
-                        modifier = Modifier.clickable { deleteTarget = t }.padding(8.dp))
+                        modifier = Modifier.clickable { vm.deleteLoop(t.id) }.padding(8.dp))
                 }
             }
         }
-        Button(onClick = { showAdd = true }, modifier = Modifier.fillMaxWidth()) { Text("添加循环待办") }
+        Button(onClick = { adding = true }, modifier = Modifier.fillMaxWidth()) { Text("添加循环待办") }
     }
 
-    if (showAdd) {
-        var title by remember { mutableStateOf("") }
-        var dow by remember { mutableIntStateOf(1) }
-        AlertDialog(
-            shape = GlassDialogShape,
-            containerColor = glassDialogContainer(),
-            modifier = glassDialogModifier(),
-            onDismissRequest = { showAdd = false }, title = { Text("添加循环待办") },
-            text = {
-                Column {
-                    OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("内容") },
-                        singleLine = true, modifier = Modifier.fillMaxWidth())
-                    Text("循环于：", fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
-                    DateUtils.WEEK_CN.forEachIndexed { i, n ->
-                        Row(verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.clickable { dow = i + 1 }) {
-                            RadioButton(selected = dow == i + 1, onClick = { dow = i + 1 })
-                            Text(n, fontSize = 14.sp)
-                        }
-                    }
+    if (adding) {
+        LoopEditDialog(
+            source = null,
+            onDismiss = { adding = false },
+            onConfirm = { title, detail, start, next ->
+                vm.addLoop(title, detail, start, next); adding = false
+            })
+    }
+    editing?.let { t ->
+        LoopEditDialog(
+            source = t,
+            onDismiss = { editing = null },
+            onConfirm = { title, detail, start, next ->
+                vm.updateLoop(t.id, title, detail, start, next); editing = null
+            })
+    }
+}
+
+/** 列表里那行小字：「每 4 天 · 下次 11月5日 周三」（今天就是提醒日时直说） */
+private fun loopScheduleLine(t: LoopTodo, todayMs: Long): String {
+    val interval = t.intervalDays.coerceAtLeast(1)
+    if (LoopSchedule.isDueOn(t, todayMs)) return "每 $interval 天 · 今天提醒"
+    val next = LoopSchedule.upcomingDate(t, todayMs)
+    val cal = DateUtils.calFrom(next)
+    return "每 $interval 天 · 下次 ${DateUtils.formatMonthDayCn(cal)} ${DateUtils.weekdayCn(cal)}"
+}
+
+/**
+ * 添加 / 编辑循环待办的弹窗（同一个壳，`source == null` 是新建）。
+ *
+ * 日期用「‹ 日期 ›」步进而不是系统的 DatePickerDialog：
+ * 这个 App 里日期一律是这套手势（待办、账目都一样），混进一个 Material 日历会突兀；
+ * 步进一次动一天，配合右边的「今」快速回到今天。
+ */
+@Composable
+private fun LoopEditDialog(
+    source: LoopTodo?,
+    onDismiss: () -> Unit,
+    onConfirm: (title: String, detail: String, startDate: Long, nextDate: Long) -> Unit,
+) {
+    val todayMs = remember { LoopSchedule.dayStart(System.currentTimeMillis()) }
+    var title by remember { mutableStateOf(source?.title ?: "") }
+    var detail by remember { mutableStateOf(source?.detail ?: "") }
+    var startMs by remember { mutableLongStateOf(source?.startDate?.takeIf { it > 0 } ?: todayMs) }
+    var nextMs by remember {
+        mutableLongStateOf(
+            source?.nextDate?.takeIf { it > 0 }
+                ?: DateUtils.addDays(DateUtils.calFrom(todayMs), 7).timeInMillis
+        )
+    }
+    var error by remember { mutableStateOf<String?>(null) }
+    val interval = LoopSchedule.intervalOf(startMs, nextMs)
+    val invalid = LoopSchedule.dayStart(nextMs) < LoopSchedule.dayStart(startMs)
+
+    AlertDialog(
+        shape = GlassDialogShape,
+        containerColor = glassDialogContainer(),
+        modifier = glassDialogModifier(),
+        onDismissRequest = onDismiss,
+        title = { Text(if (source == null) "添加循环待办" else "编辑循环待办") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                OutlinedTextField(value = title, onValueChange = { title = it; error = null },
+                    label = { Text("内容") }, singleLine = true, isError = error != null,
+                    modifier = Modifier.fillMaxWidth())
+                error?.let {
+                    Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(top = 2.dp))
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { if (title.isNotBlank()) { vm.addLoop(title, dow); showAdd = false } }) { Text("保存") }
-            },
-            dismissButton = { TextButton(onClick = { showAdd = false }) { Text("取消") } })
-    }
+                OutlinedTextField(value = detail, onValueChange = { detail = it },
+                    label = { Text("备注（可选）") }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
 
-    deleteTarget?.let { t ->
-        AlertDialog(
-            shape = GlassDialogShape,
-            containerColor = glassDialogContainer(),
-            modifier = glassDialogModifier(),
-            onDismissRequest = { deleteTarget = null },
-            title = { Text("删除这条循环待办？") },
-            text = { Text("「${t.title}」") },
-            confirmButton = {
-                TextButton(onClick = { vm.deleteLoop(t.id); deleteTarget = null },
-                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("删除") }
-            },
-            dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("取消") } })
+                LoopDateRow("开始日期", startMs, onShift = { d ->
+                    startMs = DateUtils.addDays(DateUtils.calFrom(startMs), d).timeInMillis
+                }, onToday = { startMs = todayMs })
+                LoopDateRow("下一次提醒", nextMs, onShift = { d ->
+                    nextMs = DateUtils.addDays(DateUtils.calFrom(nextMs), d).timeInMillis
+                }, onToday = { nextMs = todayMs })
+
+                Text(
+                    if (invalid) "下一次提醒不能早于开始日期" else "间隔 $interval 天",
+                    fontSize = 12.sp,
+                    color = if (invalid) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 8.dp))
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                when {
+                    title.isBlank() -> error = "请输入内容"
+                    invalid -> error = "下一次提醒不能早于开始日期"
+                    else -> onConfirm(title.trim(), detail.trim(), startMs, nextMs)
+                }
+            }) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
+}
+
+/** 弹窗里的一行日期：标签 + ‹ 日期 周X › + 「今」 */
+@Composable
+private fun LoopDateRow(label: String, ms: Long, onShift: (Int) -> Unit, onToday: () -> Unit) {
+    val cal = DateUtils.calFrom(ms)
+    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.width(6.dp))
+        StepperArrow(ChevronDir.Left) { onShift(-1) }
+        Text("${DateUtils.formatMonthDayCn(cal)} ${DateUtils.weekdayCn(cal)}",
+            fontSize = 14.sp, modifier = Modifier.padding(horizontal = 1.dp))
+        StepperArrow(ChevronDir.Right) { onShift(1) }
+        Spacer(Modifier.weight(1f))
+        Text("今", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { onToday() }.padding(6.dp))
     }
 }
 
@@ -608,20 +717,43 @@ private fun LabelText(s: String, sp: Int, c: Color) {
 private fun ExportUndonePage(vm: SettingsViewModel = viewModel()) {
     val todos by vm.todos.collectAsState(initial = emptyList())
     val ctx = LocalContext.current
-    val undone = remember(todos) { todos.filter { !it.done }.sortedBy { it.dueDate } }
+    // 按「逾期 / 今天 / 之后 / 无期限」分段导出，组内优先级高的在前、同级按日期近的在前。
+    // 原来是 sortedBy { dueDate } 一把排：无期限的 dueDate=0 反而排到最前面，
+    // 过期半年的和明天的混在一起，导出去看着像一堆没头绪的条目。
+    val groups: List<Pair<String, List<Todo>>> = remember(todos) {
+        val open = todos.filter { !it.done }
+        val todayStart = DateUtils.todayCal().timeInMillis
+        val todayEnd = todayStart + 24L * 60 * 60 * 1000 - 1
+        val order = Comparator<Todo> { a, b ->
+            if (a.priority != b.priority) b.priority - a.priority else a.dueDate.compareTo(b.dueDate)
+        }
+        listOf(
+            "已逾期" to open.filter { it.dueDate != 0L && it.dueDate < todayStart }.sortedWith(order),
+            "今天" to open.filter { it.dueDate in todayStart..todayEnd }.sortedWith(order),
+            "之后" to open.filter { it.dueDate > todayEnd }.sortedWith(order),
+            "无期限" to open.filter { it.dueDate == 0L }.sortedWith(order)
+        ).filter { it.second.isNotEmpty() }
+    }
     var exported by remember { mutableStateOf("") }
 
     Column {
-        LabelText("导出所有未完成的待办为可复制的文本", 13, MaterialTheme.colorScheme.onSurfaceVariant)
+        LabelText("导出所有未完成的待办为可复制的文本（按逾期 / 今天 / 之后 / 无期限分段）",
+            13, MaterialTheme.colorScheme.onSurfaceVariant)
         Button(onClick = {
-            exported = if (undone.isEmpty()) "暂无未完成待办"
+            exported = if (groups.isEmpty()) "暂无未完成待办"
             else buildString {
-                append("未完成待办（共 ${undone.size} 项）：\n")
-                undone.forEachIndexed { i, t ->
-                    append("${i + 1}. ${t.title}")
-                    if (t.detail.isNotBlank()) append("（${t.detail}）")
-                    if (t.dueDate != 0L) append(" · ${DateUtils.formatDateCn(t.dueDate)}")
-                    append("\n")
+                append("未完成待办（共 ${groups.sumOf { it.second.size }} 项）：\n")
+                var n = 0
+                groups.forEach { (name, list) ->
+                    append("\n【$name】${list.size} 项\n")
+                    list.forEach { t ->
+                        n++
+                        append("$n. ${t.title}")
+                        if (t.detail.isNotBlank()) append("（${t.detail}）")
+                        if (t.dueDate != 0L) append(" · ${DateUtils.formatDateCn(t.dueDate)}")
+                        if (t.priority != PRIORITY_NONE) append(" · 优先级${priorityLabel(t.priority)}")
+                        append("\n")
+                    }
                 }
             }
         }, modifier = Modifier.fillMaxWidth()) { Text("生成") }
@@ -673,10 +805,17 @@ private fun TagManagePage(vm: SettingsViewModel = viewModel()) {
         Button(onClick = { showAdd = true }, modifier = Modifier.fillMaxWidth()) { Text("添加标签") }
     }
 
+    // 「已被其它标签占用」的颜色：新增时是所有标签用过的色，修改时要排除这个标签自己那颗
+    // （否则打开修改，自己当前的颜色也会变成灰的，像是没选中）
+    val allUsedColors = remember(tags) { tags.map { it.color }.toHashSet() }
+
     if (showAdd) {
         var name by remember { mutableStateOf("") }
-        var color by remember { mutableStateOf(TAG_COLORS.first().toLong()) }
-        TagEditorDialog("添加标签", name, color,
+        // 默认选第一个**还没被占用**的颜色，省得每次都要手动挑
+        var color by remember(allUsedColors) {
+            mutableStateOf((TAG_COLORS.firstOrNull { it !in allUsedColors } ?: TAG_COLORS.first()).toLong())
+        }
+        TagEditorDialog("添加标签", name, color, allUsedColors,
             onName = { name = it }, onColor = { color = it },
             onConfirm = { vm.addTag(name.trim(), color); showAdd = false },
             onDismiss = { showAdd = false })
@@ -685,7 +824,7 @@ private fun TagManagePage(vm: SettingsViewModel = viewModel()) {
     editing?.let { tag ->
         var name by remember(tag.id) { mutableStateOf(tag.name) }
         var color by remember(tag.id) { mutableStateOf(tag.color) }
-        TagEditorDialog("修改标签", name, color,
+        TagEditorDialog("修改标签", name, color, allUsedColors - tag.color,
             onName = { name = it }, onColor = { color = it },
             onConfirm = { vm.updateTag(tag, name.trim(), color); editing = null },
             onDismiss = { editing = null })
@@ -714,7 +853,7 @@ private fun TagManagePage(vm: SettingsViewModel = viewModel()) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TagEditorDialog(
-    title: String, name: String, color: Long,
+    title: String, name: String, color: Long, usedColors: Set<Long>,
     onName: (String) -> Unit, onColor: (Long) -> Unit,
     onConfirm: () -> Unit, onDismiss: () -> Unit
 ) {
@@ -728,19 +867,32 @@ private fun TagEditorDialog(
                 OutlinedTextField(value = name, onValueChange = onName, label = { Text("标签名") },
                     singleLine = true, modifier = Modifier.fillMaxWidth())
                 Text("颜色：", fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
-                TagColorPicker(color) { onColor(it) }
+                TagColorPicker(color, usedColors) { onColor(it) }
             }
         },
         confirmButton = { TextButton(onClick = { if (name.isNotBlank()) onConfirm() }) { Text("保存") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
 }
 
-/** 标签颜色选择器：24 个色块 8×3 平铺，**不写色系名** —— 直接看颜色挑（用户 2026-10-14：不要色系名称） */
+/**
+ * 标签颜色选择器：24 色平铺、每行 8 个，**不写色系名** —— 直接看颜色挑（用户 2026-10-14）。
+ *
+ * 2026-11-01 用户口径（第三次修订，以此为准）：
+ * 「标签管理页中已经用过的颜色就不用再显示了」——
+ * 已被其它标签占用的颜色**整颗隐藏**，不再"变暗排到后面"。
+ * 于是挑色时看到的每一格都是「现在就能用」的，一眼可选，不用先辨认哪格是灰的。
+ * 例外只有两个：① 当前标签自己的颜色要留着（否则打开修改看不到自己那颗、也取消不了高亮）；
+ * ② 24 色全被占满时退回显示全部（总得让人能选，并给一行说明）。
+ */
 @Composable
-private fun TagColorPicker(selected: Long, onPick: (Long) -> Unit) {
-    // 老标签用的是旧色板的颜色（不在下面 24 色里）→ 顶上单独放一格它的原色 + 「当前」，
+private fun TagColorPicker(selected: Long, usedColors: Set<Long>, onPick: (Long) -> Unit) {
+    // 老标签用的是旧色板的颜色（不在 24 色里）→ 顶上单独放一格它的原色 + 「当前」，
     // 否则打开修改会一个圈都不亮，像是颜色丢了。
-    val legacy = TAG_COLORS.none { it == selected }
+    val legacy = !TagPalette.isInPalette(selected)
+    // 选中那颗自己不算「被占用」，否则打开修改时自己那格会被隐藏
+    val used = usedColors - selected
+    val available = TAG_COLORS.filterNot { it in used }
+    val shown = available.ifEmpty { TAG_COLORS }
     Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (legacy) {
             Row(verticalAlignment = Alignment.CenterVertically,
@@ -749,10 +901,16 @@ private fun TagColorPicker(selected: Long, onPick: (Long) -> Unit) {
                 Text("当前", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        TAG_COLORS.chunked(8).forEach { row ->
+        shown.chunked(8).forEach { row ->
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                row.forEach { c -> Swatch(c, Color(c).luminance() > 0.45f, c == selected, onPick) }
+                row.forEach { c ->
+                    Swatch(c, Color(c).luminance() > 0.45f, c == selected, onPick)
+                }
             }
+        }
+        if (available.isEmpty()) {
+            Text("24 种颜色都已被占用，这里显示全部", fontSize = 10.5.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f))
         }
     }
 }
@@ -770,9 +928,99 @@ private fun Swatch(color: Long, light: Boolean, on: Boolean, onPick: (Long) -> U
     )
 }
 
+/**
+ * 自动备份设置页。
+ *
+ * 用户 2026-11-01 要求（在一次误卸载把数据清空之后）：改任何一项条目都自动更新备份。
+ * 这一页只做三件事：开关、显示上次备份时间与位置、以及一个「立即备份一次」。
+ */
+@Composable
+private fun AutoBackupPage() {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var enabled by remember { mutableStateOf(true) }
+    var lastAt by remember { mutableLongStateOf(0L) }
+    var where by remember { mutableStateOf("") }
+    var msg by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        enabled = AutoBackup.enabled()
+        lastAt = AutoBackup.lastAt()
+        where = AutoBackup.lastWhere()
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Card(Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(14.dp)) {
+            Column {
+                SwitchRow("自动备份", enabled) { on ->
+                    enabled = on
+                    scope.launch { AutoBackup.setEnabled(on); msg = if (on) "已开启" else "已关闭" }
+                }
+                Text(
+                    if (lastAt > 0) "上次备份：${DateUtils.formatDateCn(lastAt)} ${DateUtils.formatTime(lastAt)}"
+                    else "上次备份：还没有备份过",
+                    fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                )
+                if (where.isNotBlank()) {
+                    Text("位置：$where", fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
+                }
+                Text("每次新增 / 修改 / 删除条目后，1.5 秒内自动更新一次备份（连续操作只写一次）。",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
+            }
+        }
+
+        Button(onClick = {
+            scope.launch {
+                busy = true
+                val ok = runCatching { AutoBackup.backupNow(ctx) }.getOrDefault(false)
+                lastAt = AutoBackup.lastAt()
+                where = AutoBackup.lastWhere()
+                busy = false
+                msg = if (ok) "已备份到现在" else "备份没成功（或自动备份已关闭）"
+            }
+        }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+            Text(if (busy) "备份中…" else "立即备份一次")
+        }
+
+        msg?.let {
+            Text(it, fontSize = 13.sp, color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(start = 4.dp))
+        }
+
+        Card(Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(14.dp)) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("备份放在哪、怎么用", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text("· 系统「下载 / 时序集备份 / 时序集_自动备份.json」——这是最新的一份，每次改动都会覆盖更新。",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("· 同一目录下还有按日期存的快照（每天一份，最多留 10 天），用于「最新那份万一写坏」时兜底。",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("· 这两个文件在 App 被卸载、重装、清数据之后依然存在；需要找回时进「备份 / 恢复 → 从备份文件恢复」，选它即可。",
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
 // ===== 支出明细（饼图：有标签按标签分，没标签的并成「其他」） =====
-/** 一个扇区：名称（标签名或「其他」）、金额（分）、颜色 */
-private class PieSlice(val name: String, val cents: Long, val color: Color)
+/**
+ * 一个扇区：名称（标签名或「其他」）、金额（分）、颜色、以及这一档里的每一笔。
+ *
+ * 2026-10-25 用户要求：饼图下方的每个条目可以点击，弹窗看这一档的每一笔消费
+ * （"这个月吃饭到底花在哪几笔"）。所以切片要把账目本身带出来，不能只留一个合计。
+ */
+private class PieSlice(
+    val name: String, val cents: Long, val color: Color,
+    val items: List<Account> = emptyList()
+)
 
 @Composable
 private fun ExpensePiePage(vm: SettingsViewModel = viewModel()) {
@@ -781,6 +1029,8 @@ private fun ExpensePiePage(vm: SettingsViewModel = viewModel()) {
     val today = DateUtils.todayCal()
     var y by remember { mutableIntStateOf(today.get(Calendar.YEAR)) }
     var m0 by remember { mutableIntStateOf(today.get(Calendar.MONTH)) }
+    // 点开某一档看明细（用户 2026-10-25：饼图下方每个条目可点击）
+    var detailSlice by remember { mutableStateOf<PieSlice?>(null) }
 
     // 只统计「支出」（type==0）；收入不进饼图
     val monthOut = remember(accounts, y, m0) {
@@ -795,8 +1045,10 @@ private fun ExpensePiePage(vm: SettingsViewModel = viewModel()) {
         val tagColor = tags.associate { it.name to Color(it.color.toInt()) }
         monthOut.groupBy { it.tag.trim() }
             .map { (tag, list) ->
-                if (tag.isEmpty()) PieSlice("其他", list.sumOf { it.amountCents }, Color(0xFFC7C7CC))
-                else PieSlice(tag, list.sumOf { it.amountCents }, tagColor[tag] ?: Color(0xFF8E8E93))
+                // 每档内部按时间倒序（最近一笔在最上面），和图例的「大额在前」互不影响
+                val items = list.sortedByDescending { it.date }
+                if (tag.isEmpty()) PieSlice("其他", list.sumOf { it.amountCents }, Color(TagPalette.UNLABELED), items)
+                else PieSlice(tag, list.sumOf { it.amountCents }, tagColor[tag] ?: Color(0xFF75878A), items)
             }
             .filter { it.cents > 0 }
             // 有标签的按金额从大到小，「其他」永远排最后（垫底参考，不跟标签抢位）
@@ -806,14 +1058,16 @@ private fun ExpensePiePage(vm: SettingsViewModel = viewModel()) {
     Column {
         // 月份切换：和账单总览同款 ‹ X年X月 ›
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("‹", fontSize = 22.sp, modifier = Modifier.clickable {
+            ChevronButton(ChevronDir.Left, onClick = {
                 val (ny, nm) = DateUtils.addMonths(y, m0, -1); y = ny; m0 = nm
-            }.padding(end = 10.dp))
+            }, box = 28.dp, chevron = 12.5.dp, stroke = 1.2.dp, color = MaterialTheme.colorScheme.onSurface,
+                shiftX = 3.dp, contentDescription = "上个月")
             Text("${y}年${m0 + 1}月", fontSize = 16.sp, fontWeight = FontWeight.Bold,
                 modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
-            Text("›", fontSize = 22.sp, modifier = Modifier.clickable {
+            ChevronButton(ChevronDir.Right, onClick = {
                 val (ny, nm) = DateUtils.addMonths(y, m0, 1); y = ny; m0 = nm
-            }.padding(start = 10.dp))
+            }, box = 28.dp, chevron = 12.5.dp, stroke = 1.2.dp, color = MaterialTheme.colorScheme.onSurface,
+                shiftX = (-3).dp, contentDescription = "下个月")
         }
         Spacer(Modifier.height(16.dp))
 
@@ -841,9 +1095,13 @@ private fun ExpensePiePage(vm: SettingsViewModel = viewModel()) {
             }
             Spacer(Modifier.height(16.dp))
             // 图例：色点 + 名称 + 占比 + 金额（图例和饼图同一份 slices，顺序一致）
+            // 每一行可点：弹窗列出这一档的每一笔（用户 2026-10-25 要求）
             slices.forEach { s ->
                 val pct = s.cents.toDouble() / total.toDouble() * 100.0
-                Row(Modifier.fillMaxWidth().padding(vertical = 7.dp),
+                Row(Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable { detailSlice = s }
+                        .padding(vertical = 7.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(10.dp).background(s.color, CircleShape))
                     Text(s.name, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -858,6 +1116,46 @@ private fun ExpensePiePage(vm: SettingsViewModel = viewModel()) {
                 }
             }
         }
+    }
+
+    // 某一档的明细：每一笔的备注 + 时间 + 金额（按时间倒序）
+    detailSlice?.let { sl ->
+        AlertDialog(
+            shape = GlassDialogShape,
+            containerColor = glassDialogContainer(),
+            modifier = glassDialogModifier(),
+            onDismissRequest = { detailSlice = null },
+            title = { Text("${sl.name} · ${sl.items.size} 笔", fontWeight = FontWeight.Bold) },
+            text = {
+                Column {
+                    Text("合计 ${formatCents(sl.cents)}", fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    // 弹窗自带固定高度上限，条目多时内部滚动（不会把弹窗撑出屏幕）
+                    LazyColumn(Modifier.heightIn(max = 320.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(sl.items, key = { it.id }) { a ->
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(accountTitle(a), fontSize = 14.sp, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis)
+                                    Text(
+                                        DateUtils.formatMonthDayCn(DateUtils.calFrom(a.date)) +
+                                            " " + DateUtils.formatTime(a.date),
+                                        fontSize = 11.5.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Text(formatCents(a.amountCents), fontSize = 14.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.padding(start = 10.dp))
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { detailSlice = null }) { Text("关闭") } }
+        )
     }
 }
 
@@ -929,14 +1227,16 @@ private fun BillsOverviewPage(vm: SettingsViewModel = viewModel()) {
 
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("‹", fontSize = 22.sp, modifier = Modifier.clickable {
+            ChevronButton(ChevronDir.Left, onClick = {
                 val (ny, nm) = DateUtils.addMonths(y, m0, -1); y = ny; m0 = nm
-            }.padding(end = 10.dp))
+            }, box = 28.dp, chevron = 12.5.dp, stroke = 1.2.dp, color = MaterialTheme.colorScheme.onSurface,
+                shiftX = 3.dp, contentDescription = "上个月")
             Text("${y}年${m0 + 1}月", fontSize = 16.sp, fontWeight = FontWeight.Bold,
                 modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
-            Text("›", fontSize = 22.sp, modifier = Modifier.clickable {
+            ChevronButton(ChevronDir.Right, onClick = {
                 val (ny, nm) = DateUtils.addMonths(y, m0, 1); y = ny; m0 = nm
-            }.padding(start = 10.dp))
+            }, box = 28.dp, chevron = 12.5.dp, stroke = 1.2.dp, color = MaterialTheme.colorScheme.onSurface,
+                shiftX = (-3).dp, contentDescription = "下个月")
         }
         val total = monthAcc.sumOf { if (it.type == 1) it.amountCents else -it.amountCents }
         LabelText("当月合计：${formatCents(total)}", 14, MaterialTheme.colorScheme.primary)
@@ -993,13 +1293,13 @@ private fun MonthStepper(
 ) {
     Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(label, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(end = 8.dp))
-        Text("‹", fontSize = 18.sp, color = MaterialTheme.colorScheme.primary, modifier = Modifier.clickable {
+        ChevronButton(ChevronDir.Left, onClick = {
             val (ny, nm) = DateUtils.addMonths(y, m0, -1); onYear(ny); onMonth(nm)
-        }.padding(horizontal = 6.dp))
+        }, box = 25.dp, chevron = 10.5.dp, stroke = 1.1.dp, corner = 8.dp, shiftX = 3.dp, contentDescription = "上个月")
         Text("${y}年${m0 + 1}月", fontSize = 14.sp, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
-        Text("›", fontSize = 18.sp, color = MaterialTheme.colorScheme.primary, modifier = Modifier.clickable {
+        ChevronButton(ChevronDir.Right, onClick = {
             val (ny, nm) = DateUtils.addMonths(y, m0, 1); onYear(ny); onMonth(nm)
-        }.padding(horizontal = 6.dp))
+        }, box = 25.dp, chevron = 10.5.dp, stroke = 1.1.dp, corner = 8.dp, shiftX = (-3).dp, contentDescription = "下个月")
     }
 }
 
@@ -1106,7 +1406,8 @@ private fun BackupPage(vm: SettingsViewModel = viewModel()) {
             dir.listFiles()?.forEach { it.delete() }
             val f = java.io.File(dir, stampName())
             f.writeText(json, Charsets.UTF_8)
-            val uri = FileProvider.getUriForFile(ctx, "com.rongyu.shixuji.fileprovider", f)
+            // authority 与 Manifest 一起用包名拼接：加 flavor / suffix 后仍然匹配
+            val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".fileprovider", f)
             val send = Intent(Intent.ACTION_SEND).apply {
                 type = "application/json"
                 putExtra(Intent.EXTRA_STREAM, uri)
@@ -1276,6 +1577,8 @@ private fun toast(ctx: Context, msg: String) {
 private fun BudgetPage(vm: SettingsViewModel = viewModel()) {
     var text by remember { mutableStateOf("") }
     var savedCents by remember { mutableLongStateOf(-1L) }
+    // 金额非法时给红字（原来 parseYuanToCents 返回 null 就什么都不做，连提示都没有）
+    var error by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
         val cur = vm.budgetCents()
@@ -1287,16 +1590,23 @@ private fun BudgetPage(vm: SettingsViewModel = viewModel()) {
         LabelText("设一个每月支出额度，记账页顶部的汇总卡会显示进度条，超出后变黄并标出超支金额。留空表示不设预算。",
             13, MaterialTheme.colorScheme.onSurfaceVariant)
         OutlinedTextField(
-            value = text, onValueChange = { text = it },
+            value = text, onValueChange = { text = it; error = null },
             label = { Text("每月预算（元）") }, singleLine = true,
+            isError = error != null,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
             modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
         )
+        error?.let {
+            Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+        }
         Button(onClick = {
             val cents = if (text.isBlank()) 0L else parseYuanToCents(text)
             if (cents != null) {
                 vm.setBudget(cents)
                 savedCents = cents
+                error = null
+            } else {
+                error = "请输入有效金额（如 12.50）"
             }
         }, modifier = Modifier.fillMaxWidth().padding(top = 10.dp)) { Text("保存") }
         if (savedCents > 0) {
@@ -1344,6 +1654,8 @@ private fun QuickEntryPage(vm: SettingsViewModel = viewModel()) {
         var amount by remember { mutableStateOf("") }
         var isIncome by remember { mutableStateOf(false) }
         var tag by remember { mutableStateOf("") }
+        // 名称空 / 金额非法时给一句红字：原来只 if (...) 静默不落地，用户以为保存键坏了
+        var error by remember { mutableStateOf<String?>(null) }
         AlertDialog(
             shape = GlassDialogShape,
             containerColor = glassDialogContainer(),
@@ -1352,12 +1664,16 @@ private fun QuickEntryPage(vm: SettingsViewModel = viewModel()) {
             title = { Text("添加常用记账") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(value = title, onValueChange = { title = it },
-                        label = { Text("名称") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = amount, onValueChange = { amount = it },
-                        label = { Text("金额") }, singleLine = true,
+                    OutlinedTextField(value = title, onValueChange = { title = it; error = null },
+                        label = { Text("名称") }, singleLine = true, isError = error != null,
+                        modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = amount, onValueChange = { amount = it; error = null },
+                        label = { Text("金额") }, singleLine = true, isError = error != null,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.fillMaxWidth())
+                    error?.let {
+                        Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         ShixuChip(selected = !isIncome, onClick = { isIncome = false }, label = { Text("支出") })
                         ShixuChip(selected = isIncome, onClick = { isIncome = true }, label = { Text("收入") })
@@ -1380,10 +1696,14 @@ private fun QuickEntryPage(vm: SettingsViewModel = viewModel()) {
             confirmButton = {
                 TextButton(onClick = {
                     val cents = parseYuanToCents(amount)
-                    if (title.isNotBlank() && cents != null) {
-                        vm.addQuick(QuickEntry(title = title.trim(), amountCents = cents,
-                            type = if (isIncome) 1 else 0, tag = tag, sortOrder = list.size))
-                        showAdd = false
+                    when {
+                        title.isBlank() -> error = "请输入名称"
+                        cents == null -> error = "请输入有效金额（如 12.50）"
+                        else -> {
+                            vm.addQuick(QuickEntry(title = title.trim(), amountCents = cents,
+                                type = if (isIncome) 1 else 0, tag = tag, sortOrder = list.size))
+                            showAdd = false
+                        }
                     }
                 }) { Text("保存") }
             },

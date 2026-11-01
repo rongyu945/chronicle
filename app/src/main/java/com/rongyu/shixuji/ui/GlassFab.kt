@@ -41,8 +41,8 @@ fun GlassCircleButton(
     contentDescription: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    size: Dp = 44.dp,
-    labelSize: TextUnit = 22.sp,
+    size: Dp = 55.dp,
+    labelSize: TextUnit = 27.sp,
     labelBold: Boolean = false,
     backdrop: LiquidGlassBackdropState? = null,
 ) {

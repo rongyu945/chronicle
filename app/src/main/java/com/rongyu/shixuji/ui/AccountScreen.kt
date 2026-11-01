@@ -66,6 +66,8 @@ import com.rongyu.shixuji.AppContainer
 import com.rongyu.shixuji.data.AccTagEntity
 import com.rongyu.shixuji.data.Account
 import com.rongyu.shixuji.data.QuickEntry
+import com.rongyu.shixuji.data.TagPalette
+import com.rongyu.shixuji.data.orderTagsByUsage
 import com.rongyu.shixuji.theme.*
 import com.rongyu.shixuji.ui.motion.UnifiedWeekDayNavigator
 import com.rongyu.shixuji.ui.motion.rememberReducedMotion
@@ -77,8 +79,11 @@ import kotlinx.coroutines.launch
 import java.util.Calendar
 
 private val FAB_BOTTOM = FAB_CLEARANCE   // 跟着底栏等比缩放（原来写死 92dp，底栏收缩后会悬空）
-/** 「今」按钮：「＋」上方 64dp（原来 54dp 太近容易误触；改到 72dp 又太散，取中间） */
-private val FAB_TODAY_OFFSET = 56.dp
+/**
+ * 「今」按钮的中心比「＋」高多少（与待办页同一口径：圆钮 55dp、边缘净间距 10dp）。
+ * 两页必须一致，否则切 Tab 时两个悬浮键会跳一下。
+ */
+private val FAB_TODAY_OFFSET = 65.dp
 // 列表底部留白 LIST_BOTTOM 与待办页共用同一份（见 BottomTabBar.kt），不要在这里再写一个
 
 class AccountViewModel : ViewModel() {
@@ -94,6 +99,16 @@ class AccountViewModel : ViewModel() {
     fun accountsBetween(start: Long, end: Long) = dao.observeBetween(start, end)
 
     suspend fun budgetCents(): Long = prefDao.get("budget_month")?.toLongOrNull() ?: 0L
+
+    /**
+     * 最近 30 天每个标签被用了多少次 —— 记账弹窗里标签按这个从多到少排
+     * （用户 2026-10-25：「记账界面的标签按照从最常用到最不常用排序」，口径=最近 30 天滚动窗口，
+     * 不用自然月：月初头一天不会因为"本月还没记"把顺序全打回原形）。
+     */
+    suspend fun tagUsage30d(): Map<String, Int> {
+        val since = System.currentTimeMillis() - 30L * 24 * 60 * 60 * 1000
+        return dao.countByTagSince(since).associate { it.tag to it.cnt }
+    }
 
     fun add(title: String, cents: Long, tag: String, isIncome: Boolean, dateMs: Long) =
         viewModelScope.launch(Dispatchers.IO) {
@@ -263,6 +278,13 @@ fun AccountScreen(
 
     val tagList by vm.tags.collectAsState(initial = emptyList())
     val tagColorMap = remember(tagList) { tagList.associate { it.name to Color(it.color.toInt()) } }
+    // 记账弹窗里标签的排序依据（最近 30 天用量）：只在弹窗打开时查一次，
+    // 不挂在常驻 Flow 上 —— 每记一笔都要重查整张 accounts 表没必要。
+    var tagUsage by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
+    LaunchedEffect(showAdd, editTarget?.id) {
+        if (showAdd || editTarget != null) tagUsage = vm.tagUsage30d()
+    }
+    val tagsForSheet = remember(tagList, tagUsage) { orderTagsByUsage(tagList, tagUsage) }
     val quickList by vm.quickEntries.collectAsState(initial = emptyList())
 
     var budgetCents by remember { mutableLongStateOf(0L) }
@@ -296,7 +318,7 @@ fun AccountScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(quickList, key = { it.id }) { q ->
-                        val dot = tagColorMap[q.tag] ?: Color(0xFFC7C7CC)
+                        val dot = tagColorMap[q.tag] ?: Color(TagPalette.UNLABELED)
                         Row(
                             Modifier.glassSurface(RoundedCornerShape(20.dp), dark = isDarkTheme, elevation = 3.dp)
                                 .clickable {
@@ -346,9 +368,24 @@ fun AccountScreen(
                 val pDayAcc = remember(swipeAcc, pageDayMs) {
                     swipeAcc.filter { it.date in pageDayMs..DateUtils.endOfDayMs(pageDayMs) }
                 }
-                // 分组 + 排序同样要 remember：按标签分组要排序+建 Map，条目多时每帧都在算
+                // 分组 + 排序同样要 remember：按标签分组要排序+建 Map，条目多时每帧都在算。
+                //
+                // ★ 无标签条目（tag 为空）必须**单独成组、放在最后**：
+                //   旧写法直接 groupBy { it.tag }，空标签那一组的标题被 if (isNotBlank()) 跳过 ——
+                //   于是这批条目的行就死死贴在上一个标签的条目下面，看起来完全像是被归进了
+                //   那个标签的板块（用户报的「没有标签的账目被莫名分类到别的板块」）。
+                //   现在给它们一个「未分类」标题，并且永远排在所有标签组之后。
                 val grouped = remember(pDayAcc) {
-                    pDayAcc.sortedByDescending { it.date }.groupBy { it.tag }
+                    val order = ArrayList<String>()
+                    val buckets = HashMap<String, MutableList<Account>>()
+                    pDayAcc.sortedByDescending { it.date }.forEach { a ->
+                        val k = a.tag
+                        if (k !in buckets) { buckets[k] = mutableListOf(); order += k }
+                        buckets.getValue(k).add(a)
+                    }
+                    // 有标签的组保持「最近记录在前」的出现顺序，未分类固定垫底
+                    order.filter { it.isNotBlank() }.map { it to buckets.getValue(it) } +
+                        listOfNotNull(if (order.any { it.isBlank() }) "" to buckets.getValue("") else null)
                 }
                 // 侧页（不是当前已落位的那一天）先归零：跟着手指滑进来的那一页
                 // 永远从第一条开始；落位后中心页用的就是这个 state，松手瞬间不跳。
@@ -359,8 +396,18 @@ fun AccountScreen(
                 //   并行 —— 滚动先执行、数据还没到，等 Flow 推来新条目时 LazyColumn 会按 key
                 //   把原可见那条锚在原位，新条目插在它上面看不见。用 animateScrollToItem
                 //   （平滑）而不是瞬移版：与待办页同一口径（用户 2026-10-14：「跳起来很难看」）。
-                LaunchedEffect(pageDayMs, pDayAcc.size, pDayAcc.firstOrNull()?.id) {
-                    if (pageDayMs == anchorDayStartMs) slotState.animateScrollToItem(0)
+                // ★ 回顶只在「当天条目变多」时做（新记一笔 / 把别的账目改到这一天），目的是让新条目
+                //   出现在眼前。删除、改金额、改标签都是「没变多」→ 停在用户当前看的位置。
+                //   待办页早就是这套判据；账目页原来是「变量一变就回顶」，删掉列表中间一条会突然跳到
+                //   顶部，长列表里很打断（用户 2026-10-19 一并提出）。
+                val prevCount = remember(pageDayMs) { mutableIntStateOf(-1) }
+                LaunchedEffect(pageDayMs, pDayAcc.size) {
+                    val prev = prevCount.intValue
+                    prevCount.intValue = pDayAcc.size
+                    if (prev < 0) return@LaunchedEffect                      // 首帧只记基线
+                    if (pDayAcc.size > prev && pageDayMs == anchorDayStartMs) {
+                        slotState.animateScrollToItem(0)
+                    }
                 }
                 // 只显示当天的账目，按标签分组（同标签吸附，不折叠）
                 LazyColumn(
@@ -373,35 +420,25 @@ fun AccountScreen(
                         // 空列表不再写提示字（右下角 ＋ 就在旁边）
                     } else {
                         grouped.forEach { (tag, list) ->
-                            val tagColor = tagColorMap[tag] ?: Color(0xFFC7C7CC)
-                            if (tag.isNotBlank()) {
-                                item(key = "h-$tag") {
-                                    Text(tag, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.padding(start = 6.dp, top = 8.dp, bottom = 2.dp))
-                                }
+                            val untagged = tag.isBlank()
+                            val tagColor = if (untagged) Color(TagPalette.UNLABELED) else tagColorMap[tag] ?: Color(TagPalette.UNLABELED)
+                            // 每个组都有标题（含「未分类」）：没有标题的那批条目会看起来属于上一组
+                            item(key = if (untagged) "h-\u0000blank" else "h-$tag") {
+                                Text(if (untagged) "未分类" else tag, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(start = 6.dp, top = 8.dp, bottom = 2.dp))
                             }
                             items(list, key = { it.id }) { acc ->
-                                SwipeRow(
-                                    actions = listOf("编辑" to Color(0xFF8E8E93), "删除" to MaterialTheme.colorScheme.primary),
-                                    onAction = { i ->
-                                        if (i == 0) editTarget = acc
-                                        else {
-                                            vm.delete(acc.id)
-                                            undo.show("已删除：${accountTitle(acc)}") { vm.restore(acc) }
-                                        }
-                                    },
-                                    enabled = false,
+                                // 左右滑操作已删（SwipeRow 在这里也是 enabled=false 的死代码）；
+                                // 编辑/删除都在点击后的「账目详情」弹窗里。
+                                AccountRow(
+                                    acc = acc, tagColor = tagColor,
+                                    onOpenDetail = { detailTarget = acc },
                                     // 切天时同一批账目可能换序，位置动画会造成"乱窜"，只保留占位不带动画
                                     modifier = Modifier.animateItem(
                                         fadeInSpec = null, placementSpec = null, fadeOutSpec = null
                                     )
-                                ) {
-                                    AccountRow(
-                                        acc = acc, tagColor = tagColor,
-                                        onOpenDetail = { detailTarget = acc }
-                                    )
-                                }
+                                )
                             }
                         }
                     }
@@ -434,7 +471,7 @@ fun AccountScreen(
                 tint = if (dark) Color.White.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.34f),
                 fallbackColor = if (dark) Color(0xFF3A3A3C) else Color.White,
                 labelColor = MaterialTheme.colorScheme.primary,
-                labelSize = 14.sp, labelBold = true,
+                labelSize = 17.sp, labelBold = true,
                 contentDescription = "回到今天",
                 onClick = { goDay(today.timeInMillis) },
                 backdrop = fabLayer,
@@ -443,12 +480,12 @@ fun AccountScreen(
         }
 
         // 提示条位置和待办页保持一致（记账页底部没有摘要条，132dp 就是干净的空档）
-        UndoHost(undo, Modifier.align(Alignment.BottomCenter).padding(bottom = 132.dp))
+        UndoHost(undo, Modifier.align(Alignment.BottomCenter).padding(bottom = 150.dp))
     }
 
     if (showAdd) {
         AccountEditSheet(
-            tags = tagList, editing = null,
+            tags = tagsForSheet, editing = null,
             defaultDateMs = DateUtils.atCurrentTime(shownDay),
             onSave = { t, cents, tag, isIncome, dateMs ->
                 // 新增不再弹撤回提示条（用户 2026-10-12：只保留删除的撤回），直接落库即可
@@ -463,7 +500,7 @@ fun AccountScreen(
 
     editTarget?.let { acc ->
         AccountEditSheet(
-            tags = tagList, editing = acc,
+            tags = tagsForSheet, editing = acc,
             defaultDateMs = acc.date,
             onSave = { t, cents, tag, isIncome, dateMs ->
                 scope.launch {
@@ -543,7 +580,7 @@ private fun AccountHero(monthWord: String, monthOut: Long, dayOut: Long, weekOut
         Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(shape)
             .background(
                 Brush.linearGradient(
-                    listOf(Color(0xFFFF6B61), Color(0xFFFF3B30), Color(0xFFE5342B))
+                    listOf(Color(0xFFF47983), Color(0xFFED5736), Color(0xFFC93756))   // 桃红→妃色→樱桃红
                 )
             )
             .border(glassBorder(), shape)
@@ -732,18 +769,10 @@ private fun AccountEditSheet(
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.height(38.dp)) {
                 Text("日期", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f))
-                Box(Modifier.size(32.dp).clip(RoundedCornerShape(8.dp))
-                    .clickable { dateMs = DateUtils.addDays(dateCal, -1).timeInMillis },
-                    contentAlignment = Alignment.Center) {
-                    Text("‹", fontSize = 20.sp, color = MaterialTheme.colorScheme.primary)
-                }
+                StepperArrow(ChevronDir.Left) { dateMs = DateUtils.addDays(dateCal, -1).timeInMillis }
                 Text(DateUtils.formatMonthDayCn(dateCal), fontSize = 15.sp,
-                    modifier = Modifier.padding(horizontal = 6.dp))
-                Box(Modifier.size(32.dp).clip(RoundedCornerShape(8.dp))
-                    .clickable { dateMs = DateUtils.addDays(dateCal, 1).timeInMillis },
-                    contentAlignment = Alignment.Center) {
-                    Text("›", fontSize = 20.sp, color = MaterialTheme.colorScheme.primary)
-                }
+                    modifier = Modifier.padding(horizontal = 1.dp))
+                StepperArrow(ChevronDir.Right) { dateMs = DateUtils.addDays(dateCal, 1).timeInMillis }
             }
         },
         confirmButton = {

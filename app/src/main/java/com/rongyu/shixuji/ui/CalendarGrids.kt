@@ -185,7 +185,10 @@ fun MonthNavView(evCountOfMonth: Map<Int, Map<Int, Int>>, year: Int, month: Int,
                     val dow = (day + leading - 1) % 7
                     val isWeekend = dow == 5 || dow == 6
                     Box(
+                        // 整格可点（原来 clickable 挂在里面的 Column 上，只有数字那一小块能点，
+                        // 手指偏一点就没反应 —— 月视图里点日期经常"点不动"）
                         Modifier.weight(1f).aspectRatio(1f).padding(2.dp)
+                            .clickable(enabled = day != 0) { if (day != 0) onSelectDay(day) }
                             .background(
                                 when {
                                     isToday -> MaterialTheme.colorScheme.primary
@@ -194,8 +197,7 @@ fun MonthNavView(evCountOfMonth: Map<Int, Map<Int, Int>>, year: Int, month: Int,
                                 }, CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally,
-                            modifier = Modifier.clickable(enabled = day != 0) { if (day != 0) onSelectDay(day) }) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             // 同上：lineHeight 显式给 21sp，否则继承 24sp 行高把数字在圆里顶偏
                             Text(if (day == 0) "" else "$day", fontSize = 14.sp, lineHeight = 21.sp,
                                 color = when {

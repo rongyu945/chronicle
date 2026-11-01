@@ -20,8 +20,8 @@ android {
         applicationId "com.rongyu.shixuji"
         minSdk 24
         targetSdk 34
-        versionCode 528
-        versionName "5.2.3"
+        versionCode 537
+        versionName "5.5.1"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -55,6 +55,13 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    sourceSets {
+        // Room 的 MigrationTestHelper 在**运行期**从 androidTest 的 assets 里读
+        // <版本号>.json 快照来校验迁移后的表结构；不挂这一行，迁移测试一跑就报
+        // "Cannot find schema file"。
+        androidTest.assets.srcDirs += files("$projectDir/schemas")
     }
 }
 
@@ -98,6 +105,14 @@ dependencies {
     // 备份解析（data/BackupCodec.kt）用 org.json：android.jar 里那份在 JVM 单测中是空壳
     // （所有方法都返回 null/抛 not mocked），拉一份真 jar 进来才能离线跑恢复逻辑的回归测试。
     testImplementation 'org.json:json:20240303'
+
+    // 仪器测试（需模拟器/真机）：Room 迁移校验 + DAO 冒烟。
+    // 注意 androidTest 有自己的编译单元，kotlin-test 也要单独声明。
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test:rules:1.6.1'
+    androidTestImplementation 'androidx.room:room-testing:2.6.1'
+    androidTestImplementation 'org.jetbrains.kotlin:kotlin-test-junit:2.0.21'
 
     // java.time 脱糖（配合 compileOptions.coreLibraryDesugaringEnabled）
     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'

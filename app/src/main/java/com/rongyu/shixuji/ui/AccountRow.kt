@@ -28,10 +28,10 @@ import com.rongyu.shixuji.theme.isDarkTheme
 
 /** 单条账目行（金额右对齐；单行截断显示，点击打开详情；具体时间只在详情弹窗里看） */
 @Composable
-fun AccountRow(acc: Account, tagColor: Color, onOpenDetail: () -> Unit) {
+fun AccountRow(acc: Account, tagColor: Color, onOpenDetail: () -> Unit, modifier: Modifier = Modifier) {
     val shape = RoundedCornerShape(18.dp)
     Row(
-        Modifier.fillMaxWidth().heightIn(min = LIST_ROW_MIN_HEIGHT)
+        modifier.fillMaxWidth().heightIn(min = LIST_ROW_MIN_HEIGHT)
             .glassSurface(shape, dark = isDarkTheme, elevation = 4.dp, strokeInset = 2.dp)
             .clickable { onOpenDetail() }
             .padding(horizontal = 14.dp, vertical = 3.dp),

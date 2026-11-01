@@ -316,7 +316,7 @@ fun Modifier.glassSurface(
                 // 内缩描边：薄卡片（账目行）描边贴边会显得框格太满，往里收一点（对照页 C 方案）
                 val si = strokeInset.toPx()
                 drawRoundRect(
-                    color = if (dark) Color.White.copy(alpha = 0.14f) else Color(0xFF5A4B96).copy(alpha = 0.16f),
+                    color = if (dark) Color.White.copy(alpha = 0.14f) else Color(0xFF574266).copy(alpha = 0.16f),
                     topLeft = Offset(si, si),
                     size = Size(size.width - si * 2f, size.height - si * 2f),
                     cornerRadius = CornerRadius((cr - si).coerceAtLeast(0f), (cr - si).coerceAtLeast(0f)),
@@ -324,7 +324,7 @@ fun Modifier.glassSurface(
                 )
             } else {
                 drawRoundRect(
-                    color = if (dark) Color.White.copy(alpha = 0.14f) else Color(0xFF5A4B96).copy(alpha = 0.16f),
+                    color = if (dark) Color.White.copy(alpha = 0.14f) else Color(0xFF574266).copy(alpha = 0.16f),
                     cornerRadius = corner,
                     style = Stroke(line)
                 )
@@ -350,7 +350,7 @@ fun DrawScope.drawColorBlobs(dark: Boolean) {
     // 卡片透出来的就是背景颜色，"条目发灰发脏"的根子在背景强度，不在卡片本身；
     // 背景越淡，透进来的越是纯白。深色保持 0.42 不动 —— 深色下色斑是唯一彩色来源。）
     val a = if (dark) 0.42f else 0.42f
-    drawRect(if (dark) Color(0xFF0E0F12) else Color(0xFFF4F2FB))
+    drawRect(if (dark) Color(0xFF121114) else Color(0xFFFBF6ED))   // 浅色底=宣纸，深色底=墨底
     fun blob(color: Color, alpha: Float, sizeDp: Float, xDp: Float, yDp: Float, right: Boolean, bottom: Boolean) {
         val r = (sizeDp / 2f).dp.toPx()
         val cx = if (right) size.width + xDp.dp.toPx() - r else xDp.dp.toPx() + r
@@ -364,10 +364,12 @@ fun DrawScope.drawColorBlobs(dark: Boolean) {
             radius = r, center = c
         )
     }
-    blob(Color(0xFFFF8E7A), a, 360f, -110f, -90f, right = false, bottom = false)
-    blob(Color(0xFF7FA9FF), a * 0.92f, 320f, 90f, 30f, right = true, bottom = false)
-    blob(Color(0xFFFFC98A), a * 0.88f, 340f, 100f, -40f, right = true, bottom = true)
-    blob(Color(0xFF8FE8C0), a * 0.82f, 320f, -90f, 60f, right = false, bottom = true)
+    // 2026-11 换成传统淡色（粉红/淡青/杏黄/青白）：原来的 iOS 珊瑚红+靛蓝+橙+薄荷
+    // 在宣纸底上会显出「电子味」，换传统色后整体是淡淡的一层水色。
+    blob(Color(0xFFFFB3A7), a, 360f, -110f, -90f, right = false, bottom = false)   // 粉红
+    blob(Color(0xFFC9DDF5), a * 0.92f, 320f, 90f, 30f, right = true, bottom = false) // 淡青
+    blob(Color(0xFFFFC773), a * 0.88f, 340f, 100f, -40f, right = true, bottom = true) // 姜黄
+    blob(Color(0xFFC0EBD7), a * 0.82f, 320f, -90f, 60f, right = false, bottom = true) // 青白
 }
 
 @Composable

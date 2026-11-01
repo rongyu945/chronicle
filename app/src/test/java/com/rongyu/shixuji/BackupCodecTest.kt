@@ -43,7 +43,12 @@ class BackupCodecTest {
             })
         })
         root.put("loopTodos", JSONArray().apply {
-            put(JSONObject().apply { put("id", 1); put("title", "值日"); put("dayOfWeek", 3); put("doneThisWeek", false) })
+            // 新格式（5.5.0 起）：直接给两个日期 + 间隔 + 已勾的日子
+            put(JSONObject().apply {
+                put("id", 1); put("title", "值日")
+                put("startDate", 1_700_000_000_000L); put("nextDate", 1_700_259_200_000L)
+                put("intervalDays", 3); put("doneDates", "19675")
+            })
         })
         root.put("accTags", JSONArray().apply {
             put(JSONObject().apply { put("id", 1); put("name", "餐饮"); put("color", 0xFFFF3B30L); put("icon", "") })
@@ -83,7 +88,8 @@ class BackupCodecTest {
         assertEquals(-2, t.sortOrder)          // 新条目的负序号不能丢，否则「新建的在最上面」会失效
         assertEquals(1_700_000_500_000L, t.doneAt)
         assertEquals(1580L, d.accounts!!.single().amountCents)
-        assertEquals(3, d.loopTodos!!.single().dayOfWeek)
+        // 间隔以两个日期为准（文件里写 3，日期实际相差 3 天 → 3）
+        assertEquals(3, d.loopTodos!!.single().intervalDays)
         assertEquals("餐饮", d.accTags!!.single().name)
         assertEquals(500L, d.quickEntries!!.single().amountCents)
         assertEquals(5, d.count)
@@ -163,7 +169,8 @@ class BackupCodecTest {
         val d = 解析(root.toString())
         assertEquals("优先级越界 → 夹到 3", 3, d.todos!!.single().priority)
         assertEquals("远期时间戳 → 归 0（多半是字段串了）", 0L, d.todos!!.single().dueDate)
-        assertEquals("星期几越界 → 夹到 1", 1, d.loopTodos!!.single().dayOfWeek)
+        // 没有两个日期、只有越界的 dayOfWeek → 按「每周 7 天」还原，星期几夹到 1
+        assertEquals("旧格式兜底成每周", 7, d.loopTodos!!.single().intervalDays)
         assertEquals("类型只认 1=收入，其余当支出", 0, d.accounts!!.single().type)
     }
 

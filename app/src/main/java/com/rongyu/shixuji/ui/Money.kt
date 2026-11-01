@@ -11,11 +11,22 @@ import java.math.RoundingMode
  * 0.29 变成 28 分、1.15 变成 114 分（用户可见的金额错误）。统一走 BigDecimal。
  */
 
-/** 分 → "¥12.34" / "-¥0.29" / "¥0.00" */
+private val CENT = java.math.BigInteger.valueOf(100)
+
+/**
+ * 分 → "¥12.34" / "-¥0.29" / "¥0.00"
+ *
+ * 两个坑（都是静态审查指出的边界，虽然当前调用链进不来，仍按正确写法兜住）：
+ * ① 不能用 `kotlin.math.abs(cents)`：Long.MIN_VALUE 的绝对值仍是负数（补码溢出），
+ *    会打印出 "-¥-92233720368547758.08" 这种负的金额主体。改走 BigInteger.abs()。
+ * ② 不能用 `"%d.%02d".format(...)` 的默认 Locale：在阿拉伯语等「本地数字形」的语言下
+ *    会输出 ٩٢٣ 之类的非 ASCII 数字。显式 Locale.ROOT。
+ */
 fun formatCents(cents: Long): String {
-    val sign = if (cents < 0) "-" else ""
-    val abs = kotlin.math.abs(cents)
-    return "$sign¥%d.%02d".format(abs / 100, abs % 100)
+    val value = java.math.BigInteger.valueOf(cents)
+    val sign = if (value.signum() < 0) "-" else ""
+    val parts = value.abs().divideAndRemainder(CENT)
+    return "$sign¥${parts[0]}.${parts[1].toString().padStart(2, '0')}"
 }
 
 /** 分 → 编辑框预填的纯数字串："12.34" */

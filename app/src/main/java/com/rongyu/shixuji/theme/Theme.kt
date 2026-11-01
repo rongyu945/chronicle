@@ -15,20 +15,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.rongyu.shixuji.R
 
-// 设计稿主色（iOS 浅色风）
-val Ink = Color(0xFF1C1C1E)
-val Gray = Color(0xFF8E8E93)
-val Line = Color(0xFFE5E5EA)
-val BgLight = Color(0xFFF2F2F7)
-val Accent = Color(0xFFFF3B30)      // 主题红（浅色）
-val AccentSoft = Color(0xFFFFD9D4)  // 选中药丸底色（浅色，实色保证可读）
-val AccentDark = Color(0xFFFF6B61)  // 强调红（深色，提亮不刺眼）
-val Blue = Color(0xFF0A84FF)
-val Purple = Color(0xFFAF52DE)
-val Green = Color(0xFF34C759)       // 收入绿（浅色）
-val GreenDark = Color(0xFF3ED164)   // 收入绿（深色，提亮保证对比度）
-val Teal = Color(0xFF30B0C7)
-val Orange = Color(0xFFFF9F0A)
+// 设计稿主色（2026-11 改为「中国风传统色」：色名取《中国风传统色卡》）
+val Ink = Color(0xFF392F41)         // 乌黑：正文黑，比纯黑偏一点暖紫，配宋体像墨
+val Gray = Color(0xFF75878A)        // 苍色：次要文字
+val Line = Color(0xFFE6DCCC)        // 缟（加深）：宣纸感的分隔线，冷灰线在暖底上会发脏
+val BgLight = Color(0xFFFBF6ED)     // 宣纸：界面底色（Glass.kt 画底也用它）
+val Accent = Color(0xFFED5736)      // 主题红 = 妃色
+val AccentSoft = Color(0xFFF8DCD2)  // 选中药丸底色 = 妃色淡化（实色保证可读）
+val AccentDark = Color(0xFFF05654)  // 强调红（深色）= 银红，提亮不刺眼
+val Blue = Color(0xFF177CB0)        // 靛青
+val Purple = Color(0xFF8D4BBB)      // 紫色
+val Green = Color(0xFF057748)       // 收入绿（浅色）= 松花绿（松柏绿偏浅，金额对比度只有 2.9）
+val GreenDark = Color(0xFF2EDFA3)   // 收入绿（深色）= 玉色
+val Teal = Color(0xFF549688)        // 铜绿
+val Orange = Color(0xFFFFA631)      // 杏黄
 
 /*
  * 液态玻璃配色：surface 全部是「半透明白」，底下的柔光色斑（ColorBlobsBackground）
@@ -64,16 +64,16 @@ private val LightColors = lightColorScheme(
 private val DarkColors = darkColorScheme(
     primary = AccentDark,
     onPrimary = Color.White,
-    primaryContainer = Color(0xFF5A2622),
-    onPrimaryContainer = Color(0xFFFFD9D6),
-    secondary = Color(0xFF4DA6FF),
-    onSecondary = Color(0xFF0A2540),
+    primaryContainer = Color(0xFF4A2226),      // 胭脂·深
+    onPrimaryContainer = Color(0xFFF8DCD2),
+    secondary = Color(0xFF7397AB),             // 苍青
+    onSecondary = Color(0xFF17212B),
     background = Color.Transparent,
     onBackground = Color.White,
     surface = Color.White.copy(alpha = 0.10f),
     onSurface = Color.White,
     surfaceVariant = Color.White.copy(alpha = 0.07f),
-    onSurfaceVariant = Color(0xFFC7C7CC),
+    onSurfaceVariant = Color(0xFFC2CCD0),      // 花白
     surfaceContainerLowest = Color.White.copy(alpha = 0.06f),
     surfaceContainerLow = Color.White.copy(alpha = 0.08f),
     surfaceContainer = Color.White.copy(alpha = 0.11f),

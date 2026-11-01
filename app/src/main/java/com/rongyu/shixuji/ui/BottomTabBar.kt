@@ -51,7 +51,7 @@ internal val FAB_CLEARANCE = 92.dp - TAB_BAR_SHIFT
  * （改一页忘另一页，用户看到的就是「这页能滑到底、那页最后一条压着底栏」），
  * 统一放到这里，要调一起调。
  */
-internal val LIST_BOTTOM = 180.dp
+internal val LIST_BOTTOM = 205.dp
 
 /**
  * 没有悬浮按钮的页面（设置页各二级页）的底部留白。
@@ -83,13 +83,16 @@ fun GlassBottomBar(
     val circleSize = (56 * TAB_BAR_SCALE).dp
     val barHeight = TAB_BAR_HEIGHT
 
-    // 底栏形状（给液态玻璃的折射用）。外层 BoxWithConstraints 只负责量尺寸，
-    // 真正画玻璃的是它里面那层 —— 这样玻璃层的坐标正好等于胶囊矩形。
+    // 底栏形状（给液态玻璃的折射用）。
     // 三图标重构（用户删掉「模型」后要求）：胶囊不再靠左右 34dp 边距拉满整屏，
     // 而是「每项固定 84dp」收紧成一小条居中 —— 三项散在大宽屏上会显得很空。
     // 每项 84dp 与四项时代的 85.75dp 基本一致，图标观感不变，胶囊总宽 252dp。
+    //
+    // 用 Box 而不是 BoxWithConstraints：宽度完全由 items.size 决定（barW = 每项 × 项数），
+    // 从来不读约束。原来那层 BoxWithConstraints 白付一次 subcomposition，lint 也报
+    // UnusedBoxWithConstraintsScope（`gradle lintDebug` 唯一的 ERROR）。
     val itemWidth = (84 * TAB_BAR_SCALE).dp
-    BoxWithConstraints(
+    Box(
         modifier.height(barHeight)
     ) {
         val barW = itemWidth * items.size
