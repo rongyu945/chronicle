@@ -3,12 +3,18 @@ package com.rongyu.shixuji.ui
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -17,7 +23,11 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -78,6 +88,7 @@ fun Chevron(
  * 竖直/水平居中由画布保证，不需要任何补偿偏移。
  */
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 fun ChevronButton(
     dir: ChevronDir,
     onClick: () -> Unit,
@@ -91,23 +102,52 @@ fun ChevronButton(
     // 折线在点击区里默认居中；点击区往往比折线宽得多（4–5dp 的墨迹放进 25dp 的格子），
     // 想让它贴近旁边的文字时传正值（向右）/负值（向左）把墨迹挪过去，点击区不变。
     shiftX: Dp = 0.dp,
+    // 2026-11-07 用户：「左边的热区再往左去一点」。
+    // 数值只是往**左**扩命中区，墨迹与右边界都不动（整体先左移 growStart，再把墨迹靠右对齐）。
+    // 不能靠加大 box 实现：box 变大是左右同时扩，右边会盖到日期文字，正是要避免的误触。
+    growStart: Dp = 0.dp,
     contentDescription: String? = null,
 ) {
-    Box(
-        modifier
-            .size(box)
-            .clip(RoundedCornerShape(corner))
-            .clickable(enabled = enabled) { onClick() }
-            .then(if (contentDescription != null) Modifier.semantics { this.contentDescription = contentDescription } else Modifier),
-        contentAlignment = Alignment.Center
-    ) {
-        Chevron(
-            dir = dir,
-            modifier = if (shiftX == 0.dp) Modifier else Modifier.offset(x = shiftX),
-            size = chevron,
-            stroke = stroke,
-            color = if (enabled) color else MaterialTheme.colorScheme.outlineVariant
-        )
+    // 2026-11-07 用户：「严格缩小这两个箭头的热区范围」。
+    // 默认 Modifier.clickable 外面套着 Material3 的 minimumInteractiveComponentSize，
+    // 会把 25dp 的格子自动撑到 48dp —— uiautomator 实测 126×123px。后果是：
+    //   ① 左右两个热区中间只剩 12.6dp，「7日」正好落在这条缝里，点日期被误判成翻页；
+    //   ② 左箭头热区左边缘 x=192，而「11月」文字右边缘 x=235，热区盖住「月」字右半 43px。
+    // 把最小交互尺寸置空后，热区严格等于 box（视觉多大就能点多大）。
+    // 代价：触摸目标低于 M3 建议的 48dp，无障碍合规性下降 —— 视觉精度优先，这里接受。
+    // 与 StepperArrow 同一个坑：pointerInput 只按 enabled 作 key，手势检测器不会重建，
+    // 闭包里直接调 onClick 就永远调到**第一次**那个（捕获的是旧状态 —— 日期步进器上
+    // 表现为「只能改一天」，2026-11-18 实测复现）。用 rememberUpdatedState 兜住。
+    val latestOnClick by rememberUpdatedState(onClick)
+    CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
+        Box(
+            modifier
+                .offset(x = -growStart)
+                .size(width = box + growStart, height = box)
+                .clip(RoundedCornerShape(corner))
+                // 关键：不能再用 Modifier.clickable。它的触摸区会被 Compose 的
+                // TouchBoundsExpansion 撑到系统最小触摸目标 48dp（126px），
+                // 这一层是 View 级别的，CompositionLocalProvider 里的
+                // LocalMinimumInteractiveComponentSize 管不到它（实测置空后 dump 仍是 126×123）。
+                // 换成 pointerInput 自绘命中区，热区就严格等于 .size(box)。
+                .pointerInput(enabled) {
+                    if (enabled) detectTapGestures(onTap = { latestOnClick() })
+                }
+                .semantics {
+                    if (contentDescription != null) this.contentDescription = contentDescription
+                    role = Role.Button
+                    if (enabled) onClick { latestOnClick(); true }
+                },
+            contentAlignment = if (growStart > 0.dp) Alignment.CenterEnd else Alignment.Center
+        ) {
+            Chevron(
+                dir = dir,
+                modifier = if (shiftX == 0.dp) Modifier else Modifier.offset(x = shiftX),
+                size = chevron,
+                stroke = stroke,
+                color = if (enabled) color else MaterialTheme.colorScheme.outlineVariant
+            )
+        }
     }
 }
 

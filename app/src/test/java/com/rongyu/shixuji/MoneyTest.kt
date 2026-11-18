@@ -99,4 +99,24 @@ class MoneyTest {
             Locale.setDefault(old)
         }
     }
+
+    /**
+     * 2026-11-08 审计：`BigDecimal("1e5")` 是合法的 —— 粘贴「1e5」会被当成 ¥100,000。
+     * 金额只能认十进制写法；全角数字（中文输入法全角模式）反过来要被接受。
+     */
+    @Test
+    fun 科学计数法与符号写法一律判非法() {
+        assertNull(parseYuanToCents("1e5"))
+        assertNull(parseYuanToCents("1E5"))
+        assertNull(parseYuanToCents("+5"))
+        assertNull(parseYuanToCents("1.2.3"))
+        assertNull(parseYuanToCents("0x10"))
+    }
+
+    @Test
+    fun 全角数字归一后能正常解析() {
+        assertEquals(1250L, parseYuanToCents("１２.５"))
+        assertEquals(100000L, parseYuanToCents("￥１０００"))
+        assertEquals(123456L, parseYuanToCents("１，２３４.５６"))
+    }
 }

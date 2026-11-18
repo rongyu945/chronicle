@@ -1,15 +1,22 @@
 package com.rongyu.shixuji.ui
 
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 
 /**
@@ -25,9 +32,20 @@ fun StepperArrow(
     enabled: Boolean = true,
     onClick: () -> Unit
 ) {
+    // ★ onClick 会随每次重组换新（它捕获的是当前的 dueMs/Cal），但 pointerInput 只按
+    //   enabled 作 key —— 手势检测器不会重建，闭包里若直接调 onClick 就会一直用**第一次**
+    //   那个 lambda（捕获的是旧日期）。症状：日期只能改一天，之后怎么点都停在「初始+1」。
+    //   用 rememberUpdatedState 让手势里永远调到最新的那个。
+    val latestOnClick by rememberUpdatedState(onClick)
     Box(
         Modifier.size(25.dp).clip(RoundedCornerShape(8.dp))
-            .clickable(enabled = enabled) { onClick() },
+            // 同 ChevronButton：Modifier.clickable 会被 TouchBoundsExpansion 撑到 48dp，
+            // 而这里两侧都紧贴日期文字，撑大后点日期会误触翻页。pointerInput 让热区严格等于 25dp。
+            .pointerInput(enabled) { if (enabled) detectTapGestures(onTap = { latestOnClick() }) }
+            .semantics {
+                role = Role.Button
+                if (enabled) onClick { latestOnClick(); true }
+            },
         contentAlignment = Alignment.Center
     ) {
         Chevron(

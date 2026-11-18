@@ -17,13 +17,25 @@ import com.rongyu.shixuji.R
 
 // 设计稿主色（2026-11 改为「中国风传统色」：色名取《中国风传统色卡》）
 val Ink = Color(0xFF392F41)         // 乌黑：正文黑，比纯黑偏一点暖紫，配宋体像墨
-val Gray = Color(0xFF75878A)        // 苍色：次要文字
+/*
+ * 苍色：次要文字。
+ * 0xFF75878A → 0xFF5F7075（2026-11-08 审计 I 项）：旧值在宣纸底（#F7F1E6）上只有 3.33:1，
+ * 13sp 的副标题/时间/备注这类小字看着发虚。新值实测 4.59:1 —— 过 WCAG AA 的 4.5:1 线，
+ * 色相没动（还是那支青灰），只是压深了两档。
+ */
+val Gray = Color(0xFF5F7075)
+/** 苍色·深：小字交互标签（收起 ▴ / 展开 ▾）用。浅色下 Gray 只有 4.6:1，这类提示字再压一档 */
+val GrayStrong = Color(0xFF4C5A5E)
 val Line = Color(0xFFE6DCCC)        // 缟（加深）：宣纸感的分隔线，冷灰线在暖底上会发脏
-val BgLight = Color(0xFFFBF6ED)     // 宣纸：界面底色（Glass.kt 画底也用它）
+val BgLight = Color(0xFFF7F1E6)     // 宣纸：界面底色（Glass.kt 画底也用它）
 val Accent = Color(0xFFED5736)      // 主题红 = 妃色
+/** 弹窗「保存」这类实心主按钮的颜色 = 枣红（比主题的妃色深一档，压在奶白玻璃上更沉） */
+val AccentDeep = Color(0xFFC32136)
 val AccentSoft = Color(0xFFF8DCD2)  // 选中药丸底色 = 妃色淡化（实色保证可读）
 val AccentDark = Color(0xFFF05654)  // 强调红（深色）= 银红，提亮不刺眼
 val Blue = Color(0xFF177CB0)        // 靛青
+/** 靛青（深色）：深色底上 #177CB0 只有 3.05:1，提亮到 4.6:1 —— 与 AccentDark/GreenDark 同一套做法 */
+val BlueDark = Color(0xFF4C9BC8)
 val Purple = Color(0xFF8D4BBB)      // 紫色
 val Green = Color(0xFF057748)       // 收入绿（浅色）= 松花绿（松柏绿偏浅，金额对比度只有 2.9）
 val GreenDark = Color(0xFF2EDFA3)   // 收入绿（深色）= 玉色
@@ -88,10 +100,18 @@ private val DarkColors = darkColorScheme(
 /** 全局字体：打包的 Songti SC（中文宋体 + 西文衬线）。西文/数字已在字体里下移过，与中文贴齐 */
 val songtiFamily = FontFamily(Font(R.font.songti_sc))
 
+/**
+ * 等宽数字。宋体里的数字本身是比例宽（1 比 8 窄），金额一变动整行就会左右抖；
+ * 打开 tnum 让每个数字占同样宽度，翻页/记一笔时数字「原地变化」而不是整段位移。
+ */
+val tabularNums = TextStyle(fontFeatureSettings = "tnum")
+
 private fun songtiTypography(): Typography = Typography(
-    displaySmall = TextStyle(fontFamily = songtiFamily, fontSize = 36.sp, fontWeight = FontWeight.Bold),
-    headlineMedium = TextStyle(fontFamily = songtiFamily, fontSize = 28.sp, fontWeight = FontWeight.Bold),
-    titleLarge = TextStyle(fontFamily = songtiFamily, fontSize = 22.sp, fontWeight = FontWeight.Bold),
+    // 2026-11-05 排版：大字号配负字距（-0.02em 量级）—— 宋体在大字号下字距会显得松散，
+    // 收一点才紧凑上报、有"标题感"；小字号不动，收了会挤。
+    displaySmall = TextStyle(fontFamily = songtiFamily, fontSize = 36.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.7).sp),
+    headlineMedium = TextStyle(fontFamily = songtiFamily, fontSize = 28.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp),
+    titleLarge = TextStyle(fontFamily = songtiFamily, fontSize = 22.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.3).sp),
     titleMedium = TextStyle(fontFamily = songtiFamily, fontSize = 16.sp, fontWeight = FontWeight.Medium),
     titleSmall = TextStyle(fontFamily = songtiFamily, fontSize = 14.sp, fontWeight = FontWeight.Medium),
     bodyLarge = TextStyle(fontFamily = songtiFamily, fontSize = 16.sp, lineHeight = 24.sp),

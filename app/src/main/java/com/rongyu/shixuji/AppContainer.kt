@@ -1,12 +1,15 @@
 package com.rongyu.shixuji
 
 import android.content.Context
+import android.util.Log
 import androidx.room.InvalidationTracker
 import androidx.room.Room
+import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.rongyu.shixuji.data.AppDatabase
 import com.rongyu.shixuji.data.AutoBackup
+import com.rongyu.shixuji.data.LoopSchedule
 import com.rongyu.shixuji.data.TagPalette
 import org.json.JSONArray
 import org.json.JSONObject
@@ -16,6 +19,9 @@ import java.util.Calendar
 object AppContainer {
     lateinit var database: AppDatabase
         private set
+
+    /** 「doneDates 已按公历日序号重写」的一次性标记（见 migrateLoopDayNumbers） */
+    private const val PREF_LOOP_EPOCH_DAY = "loop_epoch_day_v2"
 
     // v1 -> v2: 新增 loop_todos / acc_tags / api_models / app_prefs 四表
     private val MIGRATION_1_2 = object : Migration(1, 2) {
@@ -196,14 +202,80 @@ object AppContainer {
         }
     }
 
+    private val MIGRATION_9_10 = object : Migration(9, 10) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            // 循环待办加上手动排序位。默认 0 —— 但**不能让所有行都是 0**，
+            // 否则升级那一刻顺序退化成「按 id」，跟用户眼前看到的（按到期日）不一样，
+            // 列表会平白重排一次。所以照旧顺序（nextDate, id）回填 0,1,2…
+            db.execSQL("ALTER TABLE `loop_todos` ADD COLUMN `sortOrder` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL(
+                "UPDATE `loop_todos` SET `sortOrder` = (" +
+                    "SELECT COUNT(*) FROM `loop_todos` AS b " +
+                    "WHERE b.`nextDate` < `loop_todos`.`nextDate` " +
+                    "OR (b.`nextDate` = `loop_todos`.`nextDate` AND b.`id` < `loop_todos`.`id`)" +
+                    ")"
+            )
+        }
+    }
+
     /**
      * 全部迁移，按版本顺序。
      * 仪器测试（app/src/androidTest/.../MigrationTest.kt）直接引用这份，
      * 免得测试里另抄一份 SQL —— 抄的那份改了不会有人发现，等于没测。
      */
     val MIGRATIONS: Array<Migration> = arrayOf(
-        MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9
+        MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10
     )
+
+    /**
+     * 一次性迁移：把 loop_todos.doneDates 里记的「勾了哪一天」从旧口径搬到新口径。
+     *
+     * 背景见 [com.rongyu.shixuji.data.LoopSchedule.dayNumber]：旧口径 = floorDiv(本地零点)，
+     * 在 UTC+n 的时区里比公历日序号小 1。不改的话，升级后所有已勾的循环待办都会显示成
+     * 「这段时间一次没做」—— 用户看着就是数据丢了。
+     *
+     * 用 `app_prefs` 里的一个键当一次性标记，**整段包在一个事务里**：标记和改数据必须同生共死，
+     * 否则「改完数据、还没写标记」之间被杀进程，下次启动会再平移一天。
+     *
+     * 只在东半球（偏移为正）需要平移；西半球旧口径本来就是对的。
+     * 在 onOpen 里跑：Room 保证它先于任何业务查询，界面拿到的已经是新口径。
+     */
+    private fun migrateLoopDayNumbers(db: SupportSQLiteDatabase) {
+        db.beginTransaction()
+        try {
+            val done = db.query(
+                "SELECT value FROM app_prefs WHERE `key` = ?", arrayOf(PREF_LOOP_EPOCH_DAY)
+            ).use { it.moveToFirst() && it.getString(0) == "1" }
+            if (!done) {
+                val delta = LoopSchedule.legacyDayShift()
+                if (delta != 0L) {
+                    val rows = ArrayList<Pair<Long, String>>()
+                    db.query("SELECT id, doneDates FROM loop_todos").use { c ->
+                        while (c.moveToNext()) {
+                            if (!c.isNull(1)) rows.add(c.getLong(0) to c.getString(1))
+                        }
+                    }
+                    rows.forEach { (id, raw) ->
+                        if (raw.isNotBlank()) {
+                            db.execSQL(
+                                "UPDATE loop_todos SET doneDates = ? WHERE id = ?",
+                                arrayOf<Any>(LoopSchedule.shiftDoneDates(raw, delta), id)
+                            )
+                        }
+                    }
+                }
+                db.execSQL(
+                    "INSERT OR REPLACE INTO app_prefs (`key`, value) VALUES (?, '1')",
+                    arrayOf<Any>(PREF_LOOP_EPOCH_DAY)
+                )
+            }
+            db.setTransactionSuccessful()
+        } catch (e: Exception) {
+            Log.w("ShixuJi", "loop day-number migration failed", e)
+        } finally {
+            db.endTransaction()
+        }
+    }
 
     fun init(context: Context) {
         if (::database.isInitialized) return
@@ -214,6 +286,12 @@ object AppContainer {
             AppDatabase::class.java,
             "shixuji.db"
         ).addMigrations(*MIGRATIONS)
+            .addCallback(object : RoomDatabase.Callback() {
+                override fun onOpen(db: SupportSQLiteDatabase) {
+                    super.onOpen(db)
+                    migrateLoopDayNumbers(db)
+                }
+            })
             .build()
 
         // ★ 自动备份（用户 2026-11-01 要求：改任何一项条目后自动更新备份）

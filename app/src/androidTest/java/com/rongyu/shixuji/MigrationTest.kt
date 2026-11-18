@@ -231,33 +231,57 @@ class MigrationTest {
      *
      * 断言：①条数与文案一条不丢；②间隔一律 7 天（旧的「每周几」等价于每周一次）；
      * ③下一次提醒 = 今天起最近的那个星期几（含今天），不早于今天；
-     * ④开始日期正好是下一次提醒前 7 天；⑤没勾过的 doneDates 是空串。
+     * ④开始日期正好是下一次提醒前 7 天；⑤没勾过的 doneDates 是空串，本周勾过且那天已经到的记下具体日期。
+     *
+     * ★ 断言不能写死星期几：dow 用一个固定的 3 时，只有「今天是周四~周日」才成立，
+     *   换成周一跑就失败（曾经因此误报过一次）。这里按设备当天是星期几来造数据。
      */
     @Test
     fun v8升到v9循环待办改成两个日期() {
+        val cal = Calendar.getInstance()
+        val isoToday = if (cal.get(Calendar.DAY_OF_WEEK) == Calendar.SUNDAY) 7
+        else cal.get(Calendar.DAY_OF_WEEK) - 1
+        val futureDow = isoToday + 1                       // 本周还没到的那天（今天是周日时不存在）
         helper.createDatabase(dbName, 8).apply {
             execSQL("INSERT INTO loop_todos (id,title,detail,dayOfWeek,doneThisWeek) VALUES (1,'每周大扫除','周日做','7',0)")
-            execSQL("INSERT INTO loop_todos (id,title,detail,dayOfWeek,doneThisWeek) VALUES (2,'浇花','','3',1)")
+            execSQL("INSERT INTO loop_todos (id,title,detail,dayOfWeek,doneThisWeek) VALUES (2,'浇花','','$isoToday',1)")
+            if (futureDow <= 7) {
+                execSQL("INSERT INTO loop_todos (id,title,detail,dayOfWeek,doneThisWeek) VALUES (3,'还没到那天','','$futureDow',1)")
+            }
             close()
         }
+        val expectedCount = if (futureDow <= 7) 3 else 2
 
         helper.runMigrationsAndValidate(dbName, AppDatabase.DB_VERSION, true, *AppContainer.MIGRATIONS).use { db ->
             db.query("SELECT id, title, detail, startDate, nextDate, intervalDays, doneDates FROM loop_todos ORDER BY id").use { c ->
-                assertEquals(2, c.count)
+                assertEquals(expectedCount, c.count)
                 val today = Calendar.getInstance().apply {
                     set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
                     set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
                 }.timeInMillis
+                val todayEpochDay = Math.floorDiv(today, 86_400_000L).toString()
                 while (c.moveToNext()) {
                     assertEquals("一律每周一次", 7, c.getInt(5))
                     val start = c.getLong(3)
                     val next = c.getLong(4)
                     assertTrue("下一次提醒不能早于今天", next >= today)
-                    assertTrue("下一次提醒最多推到 7 天后", next - today < 7L * 86_400_000L)
-                    assertEquals("开始日期 = 下一次提醒 − 7 天", next - 7L * 86_400_000L, start)
-                    // 本周勾过的（id=2）记到「那一天」，没勾过的（id=1）是空串
-                    if (c.getLong(0) == 1L) assertEquals("没勾过就是空串", "", c.getString(6))
-                    else assertTrue("勾过的应记下具体哪天", c.getString(6).isNotBlank())
+                    // ★ 7.5.2（审查 5.9）：不要用「一天 = 86_400_000 毫秒」做断言。
+                    //   夏令时切换那一周，两个本地午夜相差 167 或 169 小时 —— 按毫秒差写死的
+                    //   断言在那些时区/日期会假失败（生产代码用的是 Calendar.add 按公历日加减）。
+                    assertTrue(
+                        "下一次提醒最多推到 7 天后",
+                        LoopSchedule.daysBetween(today, next) < 7L
+                    )
+                    assertEquals(
+                        "开始日期 = 下一次提醒 − 7 天",
+                        7L,
+                        LoopSchedule.daysBetween(start, next)
+                    )
+                    when (c.getLong(0)) {
+                        1L -> assertEquals("没勾过就是空串", "", c.getString(6))
+                        2L -> assertEquals("本周勾过、那天就是今天，要记下今天", todayEpochDay, c.getString(6))
+                        3L -> assertEquals("本周勾过但那天还没到，不能算完成", "", c.getString(6))
+                    }
                 }
             }
             db.query("SELECT title, detail FROM loop_todos ORDER BY id").use { c ->

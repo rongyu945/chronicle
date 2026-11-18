@@ -13,11 +13,19 @@
             android:name=".MainActivity"
             android:exported="true"
             android:screenOrientation="portrait"
-            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize">
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- 长按图标弹出的快捷方式（res/xml/shortcuts.xml）。
+                 launchMode=singleTop 是为了「App 已经在后台」时点快捷方式不再起第二个实例：
+                 走 onNewIntent 复用现有界面，否则叠两层 MainActivity、返回键要按两下才退。 -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
 
         <!-- 分享备份文件用：只暴露 cacheDir/backup_share/，不碰外部存储、不要任何权限。

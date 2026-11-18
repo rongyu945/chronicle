@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  长按桌面图标的快捷方式（用户 2026-11 提的需求）。
+
+  静态声明而不是 ShortcutManager 动态推：这几个入口是固定的，静态写法不用在启动时
+  调 API、不受「一个 App 最多 5 个动态快捷方式」影响，系统重启也不会丢。
+
+  点了之后走 MainActivity 的 action（见 MainActivity.pendingAction → MainScreen）：
+  「记一笔 / 记待办」会直接把对应的录入弹窗顶起来，省掉「打开 App → 找 Tab → 点加号」两步。
+-->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <shortcut
+        android:shortcutId="add_account"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_account"
+        android:shortcutShortLabel="@string/sc_add_account"
+        android:shortcutLongLabel="@string/sc_add_account_long">
+        <intent
+            android:action="com.rongyu.shixuji.action.TAB_ACCOUNT"
+            android:targetClass="com.rongyu.shixuji.MainActivity"
+            android:targetPackage="com.rongyu.shixuji" />
+    </shortcut>
+
+    <shortcut
+        android:shortcutId="add_todo"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_todo"
+        android:shortcutShortLabel="@string/sc_add_todo"
+        android:shortcutLongLabel="@string/sc_add_todo_long">
+        <intent
+            android:action="com.rongyu.shixuji.action.ADD_TODO"
+            android:targetClass="com.rongyu.shixuji.MainActivity"
+            android:targetPackage="com.rongyu.shixuji" />
+    </shortcut>
+
+    <shortcut
+        android:shortcutId="open_settings"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_settings"
+        android:shortcutShortLabel="@string/sc_open_settings"
+        android:shortcutLongLabel="@string/sc_open_settings_long">
+        <intent
+            android:action="com.rongyu.shixuji.action.TAB_SETTINGS"
+            android:targetClass="com.rongyu.shixuji.MainActivity"
+            android:targetPackage="com.rongyu.shixuji" />
+    </shortcut>
+
+</shortcuts>

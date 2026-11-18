@@ -1,5 +1,6 @@
 package com.rongyu.shixuji
 
+import android.content.Intent
 import android.database.sqlite.SQLiteDatabase
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
@@ -8,10 +9,24 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.mutableStateOf
 import androidx.core.view.WindowInsetsControllerCompat
+import com.rongyu.shixuji.ui.motion.LocalReducedMotion
+import com.rongyu.shixuji.ui.motion.MotionDebug
+import com.rongyu.shixuji.ui.motion.rememberReducedMotion
 import java.io.File
 
 class MainActivity : ComponentActivity() {
+
+    /**
+     * 外部入口（长按图标的快捷方式）带来的 action，交给 Compose 处理。
+     *
+     * 用 State 而不是普通字段：App 已经在后台时点快捷方式走 [onNewIntent]，
+     * 这时候界面已经在跑，只有 State 变化才会让 MainScreen 重新响应。
+     */
+    private val pendingAction = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AppContainer.init(applicationContext)
@@ -24,7 +39,28 @@ class MainActivity : ComponentActivity() {
 
         enableEdgeToEdge()
         // 主题统一在 MainScreen 里按用户设置（宋体 / 明暗）应用，这里不再多包一层
-        setContent { MainScreen(initialPrefs = seeded) }
+        // 冷启动就带着 action（点快捷方式把进程拉起来的那种情况）
+        pendingAction.value = intent?.action
+        // 7.4.1（方案 P0-6）：动效调试开关的状态在进 Compose 之前读好，
+        // 免得首帧按 1× 建动画、第二帧才变 2×（那一段会读成"顿一下"）。
+        MotionDebug.attach(applicationContext)
+        setContent {
+            // 方案 P0-5：把「减弱动态效果」提到组合根部一次，页面/弹窗/撤回/搜索页都能读到。
+            val reduced = rememberReducedMotion()
+            CompositionLocalProvider(LocalReducedMotion provides reduced) {
+                MainScreen(initialPrefs = seeded, pendingAction = pendingAction)
+            }
+        }
+    }
+
+    /**
+     * App 已在后台时点快捷方式：配合 manifest 的 launchMode="singleTop" 复用这个实例，
+     * 不再叠一个新的 MainActivity（否则返回键要按两下、界面状态也各是一份）。
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pendingAction.value = intent.action
     }
 
     /**
@@ -61,7 +97,12 @@ class MainActivity : ComponentActivity() {
         val f = findDbFile() ?: return null
         SQLiteDatabase.openDatabase(f.path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
             db.rawQuery(
-                "SELECT \"key\", value FROM app_prefs WHERE \"key\" IN ('dark','songti','font_scale','tab_order')",
+                // ★ 7.5.3（审查 7.3）：undo_ms 也在这里读 —— 不然首帧的撤回停留时长永远是默认 5 秒，
+                //   等 Room 异步读完才变，用户设成 8 秒时会看到提示条先按 5 秒出现。
+                "SELECT \"key\", value FROM app_prefs WHERE \"key\" IN " +
+                    "('dark','songti','font_scale','tab_order','undo_ms'," +
+                    "'greet_morning_start','greet_morning_end','greet_noon_start'," +
+                    "'greet_noon_end','greet_night_start','greet_night_end')",
                 null
             ).use { c ->
                 buildMap { while (c.moveToNext()) put(c.getString(0), c.getString(1)) }

@@ -56,6 +56,20 @@ import kotlinx.coroutines.launch
 import java.time.LocalDate
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.drawscope.Stroke
+import com.rongyu.shixuji.theme.isDarkTheme
+import com.rongyu.shixuji.ui.GlassRim
+import com.rongyu.shixuji.ui.LiquidGlassBackdropState
+import com.rongyu.shixuji.ui.liquidGlass
+import com.rongyu.shixuji.ui.supportsLiquidGlass
+import com.rongyu.shixuji.ui.LocalPaperBackdrop
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.offset
+import com.rongyu.shixuji.ui.motion.Motion
 
 /**
  * A single timeline for day pages, the seven-day strip and ONE red marker.
@@ -260,33 +274,42 @@ fun UnifiedWeekDayNavigator(
                     val toIndex = (target.dayOfWeek.value - 1).toFloat()
                     markerIndexOverride = fromIndex
 
-                    coroutineScope {
-                        launch {
-                            animate(
-                                initialValue = fromIndex,
-                                targetValue = toIndex,
-                                animationSpec = tween(230, easing = FastOutSlowInEasing)
-                            ) { value, _ -> markerIndexOverride = value }
-                        }
-                        launch {
-                            animate(
-                                initialValue = dayAlpha,
-                                targetValue = 0f,
-                                animationSpec = tween(105, easing = FastOutLinearInEasing)
-                            ) { value, _ -> dayAlpha = value }
-                            Snapshot.withMutableSnapshot {
-                                anchorDate = target
-                                offsetFraction = 0f
+                    // 2026-11-11「Motion P0」结构加固：复位原先写在 coroutineScope 之后，
+                    // 而 coroutineScope 会等两个 launch 跑完才返回 —— 一旦这一段被取消
+                    // （快速连点换日 / 切 Tab / 新的目标日期到来），CancellationException 会直接
+                    // 穿过它，两行复位永远不执行：markerIndexOverride 停在半路的浮点索引、
+                    // dayAlpha 停在 <1 的值上（日期内容的 alpha 就此卡住）。
+                    // 放进 finally 才是「无论正常结束还是被取消，都归位」。
+                    try {
+                        coroutineScope {
+                            launch {
+                                animate(
+                                    initialValue = fromIndex,
+                                    targetValue = toIndex,
+                                    animationSpec = tween(265, easing = Motion.Glide)
+                                ) { value, _ -> markerIndexOverride = value }
                             }
-                            animate(
-                                initialValue = 0f,
-                                targetValue = 1f,
-                                animationSpec = tween(160, easing = LinearOutSlowInEasing)
-                            ) { value, _ -> dayAlpha = value }
+                            launch {
+                                animate(
+                                    initialValue = dayAlpha,
+                                    targetValue = 0f,
+                                    animationSpec = tween(110, easing = Motion.PaperExit)
+                                ) { value, _ -> dayAlpha = value }
+                                Snapshot.withMutableSnapshot {
+                                    anchorDate = target
+                                    offsetFraction = 0f
+                                }
+                                animate(
+                                    initialValue = 0f,
+                                    targetValue = 1f,
+                                    animationSpec = tween(195, easing = Motion.PaperEnter)
+                                ) { value, _ -> dayAlpha = value }
+                            }
                         }
+                    } finally {
+                        markerIndexOverride = null
+                        dayAlpha = 1f
                     }
-                    markerIndexOverride = null
-                    dayAlpha = 1f
                 }
 
                 else -> {
@@ -407,6 +430,8 @@ fun UnifiedWeekDayNavigator(
                     .fillMaxWidth()
                     .graphicsLayer { alpha = outerAlpha }
             ) {
+                // 纸底采样源（只含背景色斑，不含本组件自己 —— 否则采样递归）
+                val paperBackdrop = LocalPaperBackdrop.current
                 SmoothWeekStrip(
                     baseDate = anchorDate,
                     unit = swipeUnit,
@@ -417,6 +442,7 @@ fun UnifiedWeekDayNavigator(
                     eventDates = eventDates,
                     today = today,
                     accentColor = accentColor,
+                    glassBackdrop = paperBackdrop,
                     onDayClick = onSelectedDateChange,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -497,7 +523,17 @@ fun SmoothWeekStrip(
     markerIndexOverride: () -> Float? = { null },
     eventDates: Set<LocalDate> = emptySet(),
     today: LocalDate = LocalDate.now(),
-    accentColor: Color? = null
+    accentColor: Color? = null,
+    /**
+     * 液态玻璃底板的采样源。
+     *
+     * 传 null（默认）= 完全保持旧观感（透明底）。
+     * 传 [LocalPaperBackdrop] 的当前值 = 日期带变成一块浮在纸上的玻璃板。
+     *
+     * ⚠️ 不能传 MainScreen 那个给底栏用的 backdrop：周条就在它的录制子树里，
+     * 采自己 = 递归。必须是只录了纸底的 [LocalPaperBackdrop]。
+     */
+    glassBackdrop: LiquidGlassBackdropState? = null
 ) {
     val currentStart = remember(baseDate) { WeekMotionMath.startOfWeek(baseDate) }
     val current = remember(currentStart) { cellsForWeek(currentStart) }
@@ -520,7 +556,82 @@ fun SmoothWeekStrip(
     }
     val markerClip = remember { AndroidPath() }
 
+    val glassSelected = glassBackdrop != null && supportsLiquidGlass
+
     Box(modifier.clipToBounds()) {
+        // ── 选中日 = 一枚真的液态玻璃球 ───────────────────────────────────
+        // 位置每帧都在变（跨周拖动时圆跟着手指横移），所以用 `Modifier.offset {}`
+        // 的 lambda：它在布局阶段执行，读 snapshot 状态**不会触发重组** ——
+        // 和原来"只在 draw 阶段读 offsetFraction"的约定一致。
+        // 采样源是纸底（LocalPaperBackdrop），不是给底栏用的那个 backdrop —— 后者
+        // 的录制子树里有本组件自己，采它会递归。
+        if (glassSelected) {
+            BoxWithConstraints(Modifier.matchParentSize()) {
+                val stripWidthPx = constraints.maxWidth.toFloat()
+                Box(
+                    Modifier
+                        .offset {
+                            val f = WeekMotionMath.frame(
+                                baseDate = baseDate,
+                                unit = unit,
+                                offsetFraction = offsetFraction(),
+                                widthPx = stripWidthPx
+                            )
+                            val cx = markerIndexOverride()?.let {
+                                (it + 0.5f) * (stripWidthPx / 7f)
+                            } ?: f.markerCenterX
+                            val r = 16.dp.toPx()
+                            IntOffset(
+                                (cx - r).roundToInt(),
+                                (37.dp.toPx() - r).roundToInt()
+                            )
+                        }
+                        .size(32.dp)
+                        .liquidGlass(
+                            backdrop = glassBackdrop!!,
+                            shape = CircleShape,
+                            // 32dp 的球，折射带不能超过半径的一半，否则边缘的弯折
+                            // 会吃到球心、数字底下开始发糊。
+                            refractionHeight = 6.dp,
+                            refractionAmount = 5.dp,
+                            blurRadius = 2.dp,
+                            // 小圆不做"整块凸起"位移：球本来就该是凸的，
+                            // 再加位移等于往同一个方向推两次，边缘会拉出月牙。
+                            depthEffect = false,
+                            // 体色 = 妃色本身，留一点透（0.88）：
+                            // 玻璃球是"有色的玻璃"，不是"红色的球加高光"。
+                            tint = primary.copy(alpha = 0.90f),
+                            veil = Color.Transparent,
+                            // 下半段不给渐变：`tintBottom` 是**往体色里混**的第二层，
+                            // 混白就把妃色冲成"上红下白"（实测像一颗融化的球）。
+                            // 真玻璃球的下缘是变深（厚度吸收），不是变白 ——
+                            // 深色由 innerShadow 语义负责，这里干脆不要。
+                            tintBottom = null,
+                            innerShadow = 0.dp,
+                            dispersion = 0.04f,
+                            rimLight = 0.14f,
+                            saturation = 1f,
+                            vibrancy = 1.05f,
+                            highlightAlpha = 0.34f,
+                            highlightAngle = 45f,
+                            highlightFalloff = 1.2f,
+                            // 光带必须窄：底栏那条 34dp 的宽带套到 32dp 的球上，
+                            // 整颗球会变成一块白斑（注释里的"发光环"）。
+                            highlightWidth = 4.dp,
+                            highlightColor = Color.White,
+                            rim = GlassRim.SPECULAR,
+                            // 内置 0.52 是按底栏调的，小球周长一半都贴着边缘 →
+                            // 必须压到 0.30 才不会糊掉妃色。
+                            // 30 → 55：0.30 时边缘几乎看不出，球就是一块平涂圆；
+                            // 32dp 的球周长大半贴着边缘，0.55 才刚好闭合形状又不发光。
+                            rimAlpha = 0.75f,
+                            // 宽扁胶囊专用的顶部横线，圆钮绝对不能用（会从上半部戳出去）。
+                            topHighlight = false,
+                        )
+                )
+            }
+        }
+
         Canvas(Modifier.matchParentSize()) {
             if (size.width <= 0f || size.height <= 0f) return@Canvas
 
@@ -555,13 +666,34 @@ fun SmoothWeekStrip(
                             center = Offset(x, centerY)
                         )
                     }
-                    if (day.date in eventDates) {
-                        drawCircle(
-                            color = primary,
-                            radius = 2.dp.toPx(),
-                            center = Offset(x, 61.dp.toPx())
-                        )
-                    }
+                }
+            }
+
+            // 有记录的圆点：**必须**画在选中标记之后。
+            // 原来它和 paleToday 一起在 marker 之前画，今天恰好有记录、又正好被选中时，
+            // 那枚 primary 圆点落在同样 primary 的实心圆上——同色，等于消失。
+            // 用户 2026-11-06 的原话是「今天和有记录都是红的，看不出区别」。
+            // 现在压在标记上时换成纸白，位置（选中圆内下沿）本身就是第二个线索。
+            fun drawEventDots(cells: List<WeekCell>, shift: Float) {
+                cells.forEachIndexed { i, day ->
+                    val x = (i + 0.5f) * cellWidth + shift
+                    if (x < -cellWidth || x > size.width + cellWidth) return@forEachIndexed
+                    if (day.date !in eventDates) return@forEachIndexed
+                    // 2026-11-07 用户：「只要我切到哪一天，白点就跟到哪一天，不如直接删掉」。
+                    //
+                    // 诊断：这枚点从来不是「选中标记」，它标的是「这一天有记录」。
+                    // 选中那天的妃色圆正好压在它上面，为了还能看见才改成纸白 ——
+                    // 结果白点落在红圆里，看起来就成了选中态的一部分；而用户几乎每天都记待办，
+                    // 于是切到哪天都有白点，读起来像「白点跟着选中走」，纯属噪声。
+                    //
+                    // 处理：选中那天不再画点。未选中时的红点照旧保留 —— 那才是它该表达的信息。
+                    // （删掉整枚点会连「这天有记录」一起丢掉，而那个信息在周条上是唯一来源。）
+                    if (abs(markerX - x) < circleRadius * 0.7f) return@forEachIndexed
+                    drawCircle(
+                        color = primary,
+                        radius = 2.dp.toPx(),
+                        center = Offset(x, 61.dp.toPx())
+                    )
                 }
             }
 
@@ -571,18 +703,31 @@ fun SmoothWeekStrip(
             }
 
             // The ONLY selected marker. It is not a child of any week page.
-            drawCircle(
-                color = primary,
-                radius = circleRadius,
-                center = Offset(markerX, centerY)
-            )
+            //
+            // 玻璃版（glassBackdrop != null）下这枚圆**不在这里画**：
+            // 它是一个真正的 Compose 玻璃球（见下面 BoxWithConstraints 里那一层），
+            // 有折射、有边缘环境光、能透出纸底。这里再画一层实心妃色就会把它整个盖掉。
+            if (!glassSelected) {
+                drawCircle(
+                    color = primary,
+                    radius = circleRadius,
+                    center = Offset(markerX, centerY)
+                )
+            }
+
+            drawEventDots(current, frame.currentWeekShiftX)
+            if (neighbor != null && frame.neighborWeekShiftX != null) {
+                drawEventDots(neighbor, frame.neighborWeekShiftX)
+            }
 
             drawIntoCanvas { composeCanvas ->
                 val canvas = composeCanvas.nativeCanvas
                 val weekBaseline = 14.dp.toPx()
-                val numberBaseline = 42.dp.toPx()
+                // 5.8.0：日期数字 14 → 15.5sp。基线同步下移 0.5dp——
+                // 字号变大而基线不动，墨迹会整体上浮约 1px，红色圆里的数字就不居中了。
+                val numberBaseline = 42.5.dp.toPx()
                 val weekdayTextPx = 11.sp.toPx()
-                val numberTextPx = 14.sp.toPx()
+                val numberTextPx = 15.5.sp.toPx()
 
                 fun drawLabels(
                     cells: List<WeekCell>,

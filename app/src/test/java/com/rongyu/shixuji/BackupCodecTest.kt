@@ -24,9 +24,10 @@ class BackupCodecTest {
     private fun 完整备份(): String {
         val root = JSONObject()
         root.put("app", "时序集")
-        root.put("schema", 2)
-        root.put("dbVersion", 6)
-        root.put("appVersion", "5.2.0")
+        root.put("schema", 3)
+        root.put("dbVersion", 10)
+        root.put("appVersion", "7.5.1")
+        root.put("loopDayEpoch", "civil")
 
         root.put("todos", JSONArray().apply {
             put(JSONObject().apply {
@@ -93,8 +94,8 @@ class BackupCodecTest {
         assertEquals("餐饮", d.accTags!!.single().name)
         assertEquals(500L, d.quickEntries!!.single().amountCents)
         assertEquals(5, d.count)
-        assertEquals("5.2.0", d.appVersion)
-        assertEquals(6, d.dbVersion)
+        assertEquals("7.5.1", d.appVersion)
+        assertEquals(10, d.dbVersion)
         // 设置项
         assertEquals("200000", d.prefs["budget_month"])
         assertEquals("1.15", d.prefs["font_scale"])
@@ -245,5 +246,175 @@ class BackupCodecTest {
         assertNull("非法明暗值必须丢弃", d.prefs["dark"])
         assertNull("非法预算必须丢弃", d.prefs["budget_month"])
         assertEquals("待办,账目,设置", d.prefs["tab_order"])
+    }
+
+    /**
+     * 2026-11-08：文件被记事本/网盘另存过会带 UTF-8 BOM，`JSONObject("\uFEFF{...}")` 直接抛。
+     * 用户看到「不是有效的 JSON 文件」，而内容其实是完好的备份。
+     */
+    @Test
+    fun 带BOM的备份文件照常能读() {
+        val data = 解析("\uFEFF" + 完整备份())
+        assertTrue(data.todos?.isNotEmpty() == true)
+    }
+
+    // ===== 7.5.1（外部审查报告 P1）新增：备份偏好白名单 / doneDates 口径 / 严格整数 =====
+
+    private fun 带偏好的备份(vararg prefs: Pair<String, Any>): String {
+        val root = JSONObject().apply {
+            put("schema", BackupCodec.SCHEMA)
+            put("appVersion", "7.5.1")
+            put("loopDayEpoch", "civil")
+            put("todos", JSONArray())
+        }
+        prefs.forEach { (k, v) -> root.put(k, v) }
+        return root.toString()
+    }
+
+    /** 审查 4.2：问候边界和撤回时长一直没进备份 —— 换手机后这两项悄悄回默认。 */
+    @Test
+    fun 备份现在带上问候时段与撤回时长() {
+        val d = 解析(
+            带偏好的备份(
+                "pref_undo_ms" to "8000",
+                "pref_greet_morning_end" to 425,
+                "pref_greet_noon_start" to 710,
+                "pref_greet_noon_end" to 790,
+                "pref_greet_night_start" to 1290,
+            )
+        )
+        assertEquals("8000", d.prefs["undo_ms"])
+        assertEquals("425", d.prefs["greet_morning_end"])
+        assertEquals("710", d.prefs["greet_noon_start"])
+        assertEquals("790", d.prefs["greet_noon_end"])
+        assertEquals("1290", d.prefs["greet_night_start"])
+    }
+
+    @Test
+    fun 越界的撤回时长与自相矛盾的问候时段整组丢弃() {
+        // 撤回时长超出 2–16 秒
+        assertNull(解析(带偏好的备份("pref_undo_ms" to "60000")).prefs["undo_ms"])
+        // 早安结束跑到午安开始之后（会画出一条反向墨线）→ 四个边界整组不要
+        val d = 解析(
+            带偏好的备份(
+                "pref_greet_morning_end" to 800,
+                "pref_greet_noon_start" to 720,
+                "pref_greet_noon_end" to 780,
+                "pref_greet_night_start" to 1260,
+            )
+        )
+        assertNull(d.prefs["greet_morning_end"])
+        assertNull(d.prefs["greet_noon_start"])
+        assertNull(d.prefs["greet_noon_end"])
+        assertNull(d.prefs["greet_night_start"])
+    }
+
+    /**
+     * 审查 4.5：旧版（6.9.4 之前）的 doneDates 是 `floorDiv(本地零点)`，
+     * 东半球比公历日序号小 1。库里的 `loop_epoch_day_v2` 迁移只管库里原有数据，
+     * 导入进来的记录它不会再管一次 —— 必须在解析阶段按来源版本补上。
+     */
+    @Test
+    fun 旧版备份的勾选日期按旧口径平移() {
+        val old = JSONObject().apply {
+            put("schema", 2)
+            put("appVersion", "6.9.3")            // 最后一个用旧口径的版本
+            put("todos", JSONArray())
+            put("loopTodos", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("id", 1); put("title", "值日")
+                    put("startDate", 1_700_000_000_000L); put("nextDate", 1_700_259_200_000L)
+                    put("intervalDays", 3); put("doneDates", "19675")
+                })
+            })
+        }
+        val d = 解析(old.toString())
+        val expected = (19675L + com.rongyu.shixuji.data.LoopSchedule.legacyDayShift()).toString()
+        assertEquals(expected, d.loopTodos!!.single().doneDates)
+    }
+
+    @Test
+    fun 新版本备份的勾选日期不会被二次平移() {
+        val now = JSONObject().apply {
+            put("schema", 2)
+            put("appVersion", "6.9.4")            // 第一个用公历日序号的版本
+            put("todos", JSONArray())
+            put("loopTodos", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("id", 1); put("title", "值日")
+                    put("startDate", 1_700_000_000_000L); put("nextDate", 1_700_259_200_000L)
+                    put("intervalDays", 3); put("doneDates", "19675")
+                })
+            })
+        }
+        assertEquals("19675", 解析(now.toString()).loopTodos!!.single().doneDates)
+    }
+
+    /** 审查 4.8：`12.9` 以前被静默截成 `12`，等于把「文件写错了」变成「导入一个合法错值」。 */
+    @Test
+    fun 小数金额被判坏而不是截断() {
+        val root = JSONObject().apply {
+            put("schema", 3)
+            put("appVersion", "7.5.1")
+            put("todos", JSONArray())
+            put("accounts", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("id", 1); put("title", "午饭"); put("amountCents", 12.9)
+                    put("type", 0); put("date", 1_700_000_000_000L)
+                })
+            })
+        }
+        assertEquals(BackupCodec.ERR_CORRUPT, 失败码(root.toString()))
+    }
+
+    /** 审查 4.9：全 App 口径是「金额绝对值 + type」，导入格式不该比输入框更宽松。 */
+    @Test
+    fun 负金额被判坏() {
+        val root = JSONObject().apply {
+            put("schema", 3)
+            put("appVersion", "7.5.1")
+            put("todos", JSONArray())
+            put("accounts", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("id", 1); put("title", "午饭"); put("amountCents", -1580)
+                    put("type", 0); put("date", 1_700_000_000_000L)
+                })
+            })
+        }
+        assertEquals(BackupCodec.ERR_CORRUPT, 失败码(root.toString()))
+    }
+
+    @Test
+    fun 版本号比较认主次修() {
+        assertTrue(BackupCodec.versionAtLeast("6.9.4", 6, 9, 4))
+        assertTrue(BackupCodec.versionAtLeast("7.5.1", 6, 9, 4))
+        assertTrue(BackupCodec.versionAtLeast("6.10.0", 6, 9, 4))
+        assertTrue(!BackupCodec.versionAtLeast("6.9.3", 6, 9, 4))
+        assertTrue(!BackupCodec.versionAtLeast("5.9.30", 6, 9, 4))
+    }
+
+    /**
+     * 审查 5.4：老版本曾把**毫秒时间戳**写进 doneDates（1.7e12 量级）。
+     * 旧清洗只过滤 >= 0，那些数会被当成「一万多年后的日序号」保留，
+     * 排序后占满「只留最近 120 个」的名额，把真实完成记录挤出去。
+     */
+    @Test
+    fun 毫秒时间戳不会被当成日序号混进完成历史() {
+        val root = JSONObject().apply {
+            put("schema", 3)
+            put("appVersion", "7.5.2")
+            put("loopDayEpoch", "civil")
+            put("todos", JSONArray())
+            put("loopTodos", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("id", 1); put("title", "值日")
+                    put("startDate", 1_700_000_000_000L); put("nextDate", 1_700_259_200_000L)
+                    put("intervalDays", 3)
+                    put("doneDates", "19675,1700000000000,19676,abc")
+                })
+            })
+        }
+        val d = 解析(root.toString())
+        assertEquals("19675,19676", d.loopTodos!!.single().doneDates)
     }
 }

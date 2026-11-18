@@ -33,12 +33,120 @@ object LoopSchedule {
     fun daysBetween(aMs: Long, bMs: Long): Long =
         Math.round((dayStart(bMs) - dayStart(aMs)).toDouble() / DAY_MS)
 
-    /** 稳定的日序号（用来在 [LoopTodo.doneDates] 里记「哪一天勾的」） */
-    fun dayNumber(ms: Long): Long = Math.floorDiv(dayStart(ms), DAY_MS)
+    /**
+     * 稳定的日序号（用来在 [LoopTodo.doneDates] 里记「哪一天勾的」）。
+     *
+     * ★ 5.9.x（2026-11-08 审计）：改成**公历日序号**（2000-01-01 为基准的 epochDay）——
+     *   由「年/月/日」三个数直接算出来，与时区无关。
+     *
+     *   旧实现是 `floorDiv(本地零点, 86400000)`。本地零点在 UTC+n 的时区里等于
+     *   **UTC 前一天 16:00**，所以算出来是 epochDay − 1；在 UTC−n 的时区里又正好等于
+     *   epochDay。也就是说这个「日序号」带时区偏移，用户一换时区（出差、改系统时区、
+     *   夏令时切换）整个序号平移一天，[LoopTodo.doneDates] 里记过的日子全部对不上：
+     *   勾过的显示未完成，再勾一次还会写重复。
+     *
+     *   老数据由 [AppContainer] 里的一次性迁移（`loop_epoch_day_v2`）平移过来。
+     */
+    fun dayNumber(ms: Long): Long {
+        val c = Calendar.getInstance().apply { timeInMillis = ms }
+        return daysFromCivil(
+            c.get(Calendar.YEAR), c.get(Calendar.MONTH) + 1, c.get(Calendar.DAY_OF_MONTH)
+        )
+    }
 
-    /** 间隔天数：至少 1 天（两个日期填成同一天就等于每天提醒） */
+    /**
+     * 公历 → 日序号（1970-01-01 = 0）。
+     *
+     * Howard Hinnant 的 days_from_civil：纯整数运算，不看时区/夏令时/闰秒，
+     * 1875 年之后、10000 年之前都准确（够用到没人再打开这个 App 的时候）。
+     */
+    fun daysFromCivil(year: Int, month: Int, day: Int): Long {
+        val y = if (month <= 2) year - 1 else year
+        val era = (if (y >= 0) y else y - 399) / 400
+        val yoe = y - era * 400                                     // 0..399
+        val mp = (month + 9) % 12                                   // 3 月 = 0
+        val doy = (153 * mp + 2) / 5 + day - 1                       // 0..365
+        val doe = yoe * 365 + yoe / 4 - yoe / 100 + doy              // 0..146096
+        return era.toLong() * 146097L + doe - 719468L
+    }
+
+    /**
+     * 旧格式（`floorDiv(本地零点)`）与现在这个公历日序号的差，单位「天」。
+     *
+     * ★ 已知局限（审查 5.6）：这里只看**执行迁移那一刻**的系统时区。
+     *   如果用户在用老版本时出过国、或迁移前后改过系统时区，旧数据写入时的时区
+     *   就可能和现在不同，平移量会算错。历史版本没有记录「写入时的时区」，
+     *   无法可靠推断 —— 能做的是把局限写清楚、别在此基础上继续加规则。
+     *   （备份导入走 [com.rongyu.shixuji.data.BackupCodec] 里按 appVersion 判定的同一条口径。）
+     *
+     * UTC+n（含 +5:30 这类）记为差 1，UTC−n 差 0 —— 与偏移量的大小无关，只看符号：
+     * 本地零点永远是「当地那天的 00:00」，而它在 UTC 里落在前一天还是同一天，
+     * 只取决于当地是东经还是西经时区。
+     */
+    fun legacyDayShift(): Long {
+        val offset = Calendar.getInstance().timeZone.getOffset(System.currentTimeMillis())
+        return if (offset > 0) 1L else 0L
+    }
+
+    /**
+     * `doneDates` 里合法「日序号」的上限：约 4700 年。
+     *
+     * 超过它的值不可能是公历日序号 —— 更老的版本曾把**毫秒时间戳**塞进这个字段
+     * （1.7e12 量级），它们排序在所有正常日序号之后，会把「只留最近 120 天」的名额占满，
+     * 把真实的完成记录挤掉。清洗与迁移必须用**同一个**上下界，否则一边认一边不认。
+     */
+    /**
+     * 日序号的上界。
+     *
+     * 依据（复核报告 3.4 要求写明）：公历日序号从 1970-01-01 = 0 起算，1,000,000 天 ≈ 公元 4708 年，
+     * 任何真实日期都远小于它；同时毫秒时间戳 ≥ 1.6e12（2020 年），远大于它 ——
+     * 上下两边都留了三个数量级的空档，老版本塞进 `doneDates` 的毫秒时间戳不会被误当成日序号。
+     */
+    const val MAX_DAY_NUMBER = 1_000_000L
+
+    /** 这个数像不像一个日序号（[0, MAX_DAY_NUMBER]） */
+    fun isDayNumber(v: Long): Boolean = v in 0L..MAX_DAY_NUMBER
+
+    /** 循环间隔上限（天）。UI 与算法共用，别各写一份。 */
+    const val MAX_INTERVAL_DAYS = 3650
+
+    /**
+     * 迁移用：把一整串旧格式的 doneDates 整体平移 [delta] 天（去重、降序、仍只留最近 MAX_KEPT 天）。
+     *
+     * 只平移「像日序号」的值（见 [isDayNumber]）。更老的版本曾经往这个字段里
+     * 塞过毫秒时间戳，那种值平移一下也是废数 —— 原样留着，别把用户的账搅得更乱。
+     */
+    fun shiftDoneDates(raw: String, delta: Long): String {
+        if (delta == 0L || raw.isBlank()) return raw
+        return raw.split(',')
+            .mapNotNull { it.trim().toLongOrNull() }
+            .map { if (isDayNumber(it)) it + delta else it }
+            .distinct()
+            .sortedDescending()
+            .take(MAX_KEPT)
+            .joinToString(",")
+    }
+
+    /**
+     * 编辑已有循环待办时该用哪个间隔。
+     *
+     * ★ 7.5.5（复核报告 3.9）：`nextDate` 会被 [advanceNext] 不断往前推，所以「两个日期相减」
+     *   得到的不是周期，而是「距上次提醒过去了多少天」。旧版保存时无条件按日期反推 ——
+     *   打开弹窗、什么都不改、点保存，周期就从 1 天变成 12 天，提醒序列跟着变（实测：吃维生素）。
+     *
+     *   现在：库里已经有 [LoopTodo.intervalDays] 就**以它为准**（权威值），只有新建
+     *   （`stored == null`）才由两个日期推出初次间隔。用户想改周期，用弹窗里「间隔」那行的
+     *   ‹ › 显式改 —— 那是一次明确的动作，不再是「打开即变」的副作用。
+     */
+    fun intervalForEdit(stored: Int?, startDate: Long, nextDate: Long): Int =
+        stored?.coerceIn(1, MAX_INTERVAL_DAYS) ?: intervalOf(startDate, nextDate)
+
+    /** 两个日期之间的间隔天数：至少 1 天（填成同一天就等于每天提醒），最多 [MAX_INTERVAL_DAYS] 天 */
     fun intervalOf(startDate: Long, nextDate: Long): Int =
-        daysBetween(startDate, nextDate).coerceAtLeast(1L).coerceAtMost(3650L).toInt()
+        daysBetween(startDate, nextDate)
+            .coerceAtLeast(1L)
+            .coerceAtMost(MAX_INTERVAL_DAYS.toLong())
+            .toInt()
 
     /**
      * 这一天该不该出现这条循环待办。

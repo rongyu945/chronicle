@@ -41,7 +41,9 @@ interface TodoDao {
      */
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsert(todo: Todo): Long
     @Query("DELETE FROM todos WHERE id = :id") suspend fun delete(id: Long)
-    @Query("UPDATE todos SET done = :done WHERE id = :id") suspend fun setDone(id: Long, done: Boolean)
+    // （原 setDone 已删：它只改 done、不清 doneAt，勾上后 doneAt 还是 0，
+    //   dayOpen 排除它、dayDone 又要求 doneAt 落在当天 → 条目会从界面彻底消失。
+    //   勾选统一走下面的 setDoneFull。）
     @Query("UPDATE todos SET title = :title, detail = :detail, dueDate = :dueDate WHERE id = :id")
     suspend fun update(id: Long, title: String, detail: String, dueDate: Long)
     @Query("UPDATE todos SET priority = :priority WHERE id = :id") suspend fun setPriority(id: Long, priority: Int)
@@ -67,10 +69,26 @@ interface TodoDao {
      * 未完成条目之间会被优先级/日期重新洗一遍（用户看到的「条目乱跳」）。
      * 现在只有 done 那一级参与比较，勾掉的一条落到已完成区，其余相对顺序原样保留。
      */
-    @Query("SELECT * FROM todos ORDER BY sortOrder ASC, CASE WHEN done = 1 THEN doneAt ELSE 0 END ASC, priority DESC, dueDate ASC")
+    // 2026-11-07 用户：「待办界面怎么都不按照重要性排序的呀？」
+    // 根因：原来 `sortOrder ASC` 是第一键，而新建待办拿的是 `minSortOrder() - 1`（排最上），
+    // 于是列表顺序 = 创建顺序倒过来，`priority DESC` 永远排不上用场 —— 高优先级的反而垫底。
+    // 现在 `priority DESC` 提到第一键：高 → 中 → 低 → 无。
+    // 同档之内仍按 `sortOrder ASC`，所以手动拖拽和「新建排本档最上」都还在，
+    // 只是拖不过优先级那一道坎（想挪到别的档就改优先级，这也是它该有的语义）。
+    // ★ 已完成那一级必须是 DESC：doneAt 越大 = 越晚完成，用户要的是「最近完成的排最前」。
+    //   旧写法 ASC 正好相反（最早完成在最前），只是被 TodoScreen 里再 `sortedByDescending { doneAt }`
+    //   盖住了；任何直接用 observeAll() 顺序渲染的地方都会看到反的结果。
+    @Query("SELECT * FROM todos ORDER BY priority DESC, sortOrder ASC, CASE WHEN done = 1 THEN doneAt ELSE 0 END DESC, dueDate ASC")
     fun observeAll(): Flow<List<Todo>>
     @Query("SELECT * FROM todos") suspend fun getAll(): List<Todo>
     @Query("DELETE FROM todos") suspend fun clear()
+
+    // ── 批量整理专用（5.7.1）：一条 SQL 处理一批，不要 forEach 循环开事务 ──
+    @Query("DELETE FROM todos WHERE id IN (:ids)") suspend fun deleteAll(ids: List<Long>)
+    @Query("UPDATE todos SET dueDate = :dueDate WHERE id IN (:ids)")
+    suspend fun setDueAll(ids: List<Long>, dueDate: Long)
+    @Query("UPDATE todos SET priority = :priority WHERE id IN (:ids)")
+    suspend fun setPriorityAll(ids: List<Long>, priority: Int)
 }
 
 // ===== 账目 =====
@@ -135,11 +153,30 @@ data class LoopTodo(
     val nextDate: Long = 0L,
     val intervalDays: Int = 7,
     val doneDates: String = "",
+    /**
+     * 手动排序用（v10 新增）。0 起、越小越前。
+     *
+     * 为什么循环待办也要这个字段：它是列表里的一节，附近三节（当天 / 过往未完成 / 无期限）
+     * 都带左边把手、能长按拖动换位，只有这一节拖不动 —— 用户 2026-11-09 直接问
+     * 「为什么不能像其他待办一样左边有个把手」。没有这列就只能按 nextDate 派生顺序，拖了也没处存。
+     */
+    val sortOrder: Int = 0,
 )
 
 @Dao
 interface LoopTodoDao {
     @Insert suspend fun insert(t: LoopTodo): Long
+
+    /**
+     * 撤回删除用：按原 id 插回。
+     *
+     * ★ 不能用上面的 [insert]：它是默认的 ABORT，一旦那条 id 已经被新记录占用
+     *  （删掉最大 id 后再新建，SQLite 会复用这个号）就抛 SQLiteConstraintException，
+     *   而且是在 viewModelScope 的协程里抛 —— 直接崩 App。待办/账目那边一直是 upsert，
+     *   这两个 DAO 以前只在设置页用到、没人想到撤回，漏了。
+     */
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsert(t: LoopTodo): Long
+
     @Query("UPDATE loop_todos SET title = :title, detail = :detail, startDate = :startDate, " +
         "nextDate = :nextDate, intervalDays = :intervalDays WHERE id = :id")
     suspend fun update(id: Long, title: String, detail: String,
@@ -150,7 +187,15 @@ interface LoopTodoDao {
     @Query("UPDATE loop_todos SET nextDate = :nextDate WHERE id = :id")
     suspend fun setNextDate(id: Long, nextDate: Long)
     @Query("DELETE FROM loop_todos WHERE id = :id") suspend fun delete(id: Long)
-    @Query("SELECT * FROM loop_todos ORDER BY nextDate ASC, id ASC") fun observeAll(): Flow<List<LoopTodo>>
+    // 排序：先按手动顺序，同序号（老数据全是 0）再按到期日 —— 老库升级上来时表现和以前一致
+    @Query("SELECT * FROM loop_todos ORDER BY sortOrder ASC, nextDate ASC, id ASC")
+    fun observeAll(): Flow<List<LoopTodo>>
+
+    @Query("UPDATE loop_todos SET sortOrder = :order WHERE id = :id")
+    suspend fun setSortOrder(id: Long, order: Int)
+
+    /** 新增一条时排在最后：取当前最大值 + 1（空表给 0） */
+    @Query("SELECT IFNULL(MAX(sortOrder), -1) FROM loop_todos") suspend fun maxSortOrder(): Int
     @Query("SELECT * FROM loop_todos WHERE id = :id") suspend fun getById(id: Long): LoopTodo?
     @Query("SELECT * FROM loop_todos") suspend fun getAll(): List<LoopTodo>
     @Query("DELETE FROM loop_todos") suspend fun clear()
@@ -189,6 +234,9 @@ data class QuickEntry(
 @Dao
 interface QuickEntryDao {
     @Insert suspend fun insert(e: QuickEntry): Long
+
+    /** 撤回删除用（同 [LoopTodoDao.upsert]：按原 id 插回，id 被占用也不崩） */
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsert(e: QuickEntry): Long
     @Query("DELETE FROM quick_entries WHERE id = :id") suspend fun delete(id: Long)
     @Query("SELECT * FROM quick_entries ORDER BY sortOrder ASC, id ASC") fun observeAll(): Flow<List<QuickEntry>>
     @Query("SELECT * FROM quick_entries") suspend fun getAll(): List<QuickEntry>
@@ -233,7 +281,7 @@ data class TagCount(val tag: String, val cnt: Int)
 
 @Database(
     entities = [Todo::class, Account::class, LoopTodo::class, AccTagEntity::class, AppPref::class, QuickEntry::class],
-    version = 9,
+    version = 10,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -248,14 +296,20 @@ abstract class AppDatabase : RoomDatabase() {
          * 这一组一律以备份为准，备份里没有 = 回到默认。这条组里不含 loop_week
          * 这类内部状态（它不是"设置"，被覆盖会让循环待办提前/延后一周清零）。
          */
-        val PREF_KEYS = listOf("budget_month", "font_scale", "songti", "dark", "tab_order")
+        /**
+         * 恢复备份时**可能**被替换的偏好键（白名单见 [BackupCodec.PREF_MAP]）。
+         *
+         * 实际恢复只替换「文件里确实带了」的那几个（`prefDao.removeAll(data.prefs.keys)`）——
+         * 整组删除会把老备份里不存在的项抹成默认。
+         */
+        val PREF_KEYS: List<String> = BackupCodec.PREF_KEYS
 
         /**
          * 当前数据库版本。**改 @Database(version = ...) 时必须同步改这里** —— 备份文件靠它
          * 记录"这份数据来自哪一版"，恢复时才知道字段够不够。之所以另存一个常量而不是读
          * Room 运行时值，是因为导出备份的地方（SettingsViewModel）不该为了一个数字去碰数据库实例。
          */
-        const val DB_VERSION = 9
+        const val DB_VERSION = 10
     }
 
     abstract fun todoDao(): TodoDao

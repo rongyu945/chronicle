@@ -1,4 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">时序集</string>
+
+    <!-- 长按图标（shortcuts.xml）：短标签系统会截到十来个字，长标签给「更多空间时」用 -->
+    <string name="sc_add_account">打开记账</string>
+    <string name="sc_add_account_long">打开记账界面</string>
+    <string name="sc_add_todo">记待办</string>
+    <string name="sc_add_todo_long">记一条待办</string>
+    <string name="sc_open_settings">设置</string>
+    <string name="sc_open_settings_long">打开设置</string>
+
+    <!--
+      界面文案（2026-11-08 审计 H 项，第一批：按钮 / 确认 / 空态 / 提示四类里重复度最高的那些）。
+
+      为什么不再写死在代码里：
+        ① TalkBack 读的就是这些字符串，散在 4 个文件里没法统一术语（「待办 / 项目」混用过）；
+        ② 同一句话在多处出现时，改一处忘一处就会出现「取消 / 取 消」这类不一致；
+        ③ 将来要做多语言，这批是最先被翻的。
+      后续新增文案请按同一口径加在这里，不要直接写中文字面量。
+    -->
+    <string name="action_cancel">取消</string>
+    <string name="action_save">保存</string>
+    <string name="action_delete">删除</string>
+    <string name="action_close">关闭</string>
+    <string name="todo_no_due">无期限</string>
+
+    <!-- 记账 -->
+    <string name="acc_expense">支出</string>
+    <string name="acc_income">收入</string>
+
+    <!-- 备份 / 恢复 -->
+    <string name="backup_export">导出备份文件</string>
+    <string name="backup_share">分享备份文件</string>
+    <string name="backup_restore">从备份文件恢复</string>
 </resources>

@@ -38,8 +38,26 @@ fun centsToYuanString(cents: Long): String =
  * 例："0.29" → 29；"1.15" → 115；"3.145" → 315；"." / "-5" / 乱码 → null
  */
 fun parseYuanToCents(input: String): Long? {
-    val t = input.trim().removePrefix("¥").replace(",", "").replace(" ", "")
+    // ★ 全角数字先归一再判断：中文输入法/网页粘贴常带「１２.５」，
+    //   旧版 `BigDecimal("１２.５")` 直接抛异常 → 用户看到「请输入有效金额」，明明输入是合法的。
+    val normalized = buildString(input.length) {
+        input.forEach { c ->
+            append(
+                when {
+                    c in '０'..'９' -> '0' + (c - '０')
+                    c == '．' -> '.'
+                    c == '，' -> ','
+                    c == '￥' -> '¥'
+                    else -> c
+                }
+            )
+        }
+    }
+    val t = normalized.trim().removePrefix("¥").replace(",", "").replace(" ", "")
     if (t.isEmpty() || t == "." || t == "-") return null
+    // ★ 只认「纯十进制」写法。`BigDecimal` 连科学计数法都吃：`"1e5"` → 10_000_000 分 = ¥100,000，
+    //   `"+5"` → ¥5。数字键盘敲不出来，但粘贴/第三方输入法可以 —— 静默变成 10 万元是灾难。
+    if (!Regex("^\\d+(\\.\\d+)?$").matches(t)) return null
     return try {
         val bd = BigDecimal(t).setScale(2, RoundingMode.HALF_UP)
         if (bd.signum() < 0) return null
@@ -50,6 +68,15 @@ fun parseYuanToCents(input: String): Long? {
         null
     }
 }
+
+/**
+ * 金额框的统一解析：纯数字走 [parseYuanToCents]，带 `+ - * /` 的按算式算（见 [com.rongyu.shixuji.data.AmountExpr]）。
+ * 两边的上限、四舍五入口径完全一致，所以用户看不出区别。
+ */
+fun amountToCents(input: String): Long? =
+    if (com.rongyu.shixuji.data.AmountExpr.isExpression(input))
+        com.rongyu.shixuji.data.AmountExpr.evalToCents(input)
+    else parseYuanToCents(input)
 
 /**
  * 账目的显示名：优先备注；备注为空（或历史数据里被写成占位符"记账"）时用标签名兜底。

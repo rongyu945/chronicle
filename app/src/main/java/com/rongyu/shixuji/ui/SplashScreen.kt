@@ -4,26 +4,46 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.border
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathOperation
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.rongyu.shixuji.theme.Accent
+import com.rongyu.shixuji.data.GreetingTimes
 import com.rongyu.shixuji.theme.songtiFamily
 import java.util.Calendar
+import com.rongyu.shixuji.ui.motion.Motion
+import com.rongyu.shixuji.ui.motion.motionSpec
 
 /**
  * 红楼梦诗词（需求：启动页随机展示，无作者→佚名 无题→无题）。
@@ -211,63 +231,293 @@ private fun FitOneLine(
     }
 }
 
-/** 启动页：仅早晚出现（0-7 早 早安浅色 / 21-24 晚 晚安深色），随机红楼梦诗词，用打包宋体 */
+/** 「开启时序集」胶囊的高度（圆角吃满半高即为胶囊）。 */
+private val SPLASH_BTN_H = 46.dp
+
+/** 三段各自的配色。文案、色值都照设计稿（宣纸白 / 浅青瓷 / 墨夜）。 */
+private data class SplashPalette(
+    val bg: Brush,
+    val text: Color,
+    val sub: Color,
+    val btnText: Color,
+    val dark: Boolean,
+)
+
+/**
+ * 欢迎页（2026-11-11 改版，7.2.5）。
+ *
+ * 相对上一版变了四件事：
+ *  ① **三个时段**：早安 / 午安 / 晚安，边界由设置页「问候时段」决定（[GreetingTimes]），
+ *    不再是写死的 0-6 / 21-23。两段之间的时间（如 07:00–12:00）仍直接进主界面。
+ *  ② **字框式布局**：问候退到左上角小字，诗句与出处装进一个直角细框、四角加小角标。
+ *  ③ **框与按钮视为一体**：「开启时序集」挪进框内，整块一起竖向居中 ——
+ *    上一版按钮单独吊在屏幕下方 74dp 处，视觉上跟诗句是两件事。
+ *  ④ **按钮做成液态玻璃胶囊**（统一配方见 [liquidCapsule]）+ 点击震动。
+ *
+ * 玻璃要采样身后那层渐变，所以背景单独画在一层挂了 [recordBackdrop] 的 Box 里，
+ * 且玻璃按钮必须在那层**外面**（否则会把自己录进去 → 递归）。
+ */
 @Composable
-fun SplashScreen(onEnter: () -> Unit) {
-    val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
-    val isMorning = hour in 0..6           // 早间 0-7
-    val isEvening = hour in 21..23         // 晚间 21-24
-    val show = isMorning || isEvening      // 仅早晚出现
-    if (!show) {
-        // 非早晚：异步跳转主界面（避免 composition 期间副作用）
+fun SplashScreen(
+    onEnter: () -> Unit,
+    times: GreetingTimes = GreetingTimes.DEFAULT,
+    // 7.5.0：设置页的「预览欢迎页」用它把时段钉死（不必改系统时间），
+    // 传了就是预览态 —— 不改 splashDone、不写任何偏好，按钮变成「返回设置」。
+    previewKind: Int? = null,
+) {
+    val cal = Calendar.getInstance()
+    val nowMin = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+    val kind = previewKind ?: times.greetingAt(nowMin)
+    if (kind == null) {
+        // 非问候时段：异步跳转主界面（避免 composition 期间副作用）
         LaunchedEffect(Unit) { onEnter() }
         return
     }
 
     val poem = remember { poems.random() }
-    val greeting = if (isMorning) "早安" else "晚安"
-    // 早 浅色米暖渐变，晚 深色
-    val bg = if (isMorning)
-        Brush.verticalGradient(listOf(Color(0xFFFFF7E0), Color(0xFFFFE3B3)))
-    else
-        Brush.verticalGradient(listOf(Color(0xFF1A1A2E), Color(0xFF16213E)))
-    val textColor = if (isMorning) Color(0xFF3A2E1E) else Color(0xFFE8E6E0)
-    val subColor = if (isMorning) Color(0xFF8A7A5A) else Color(0xFFA0A0B0)
+    val greeting = when (kind) {
+        GreetingTimes.GREETING_MORNING -> "早安"
+        GreetingTimes.GREETING_NOON -> "午安"
+        else -> "晚安"
+    }
+    val palette = when (kind) {
+        GreetingTimes.GREETING_MORNING -> SplashPalette(
+            bg = Brush.verticalGradient(listOf(Color(0xFFFFF7E0), Color(0xFFFFE3B3))),
+            text = Color(0xFF3A2E1E), sub = Color(0xFF8A7A5A),
+            btnText = Color(0xFF7A2E24), dark = false,
+        )
+        GreetingTimes.GREETING_NOON -> SplashPalette(
+            bg = Brush.verticalGradient(listOf(Color(0xFFF4FAF8), Color(0xFFDDEDE9))),
+            text = Color(0xFF2E3A38), sub = Color(0xFF6C837C),
+            btnText = Color(0xFF2E5B50), dark = false,
+        )
+        else -> SplashPalette(
+            bg = Brush.verticalGradient(listOf(Color(0xFF1A1A2E), Color(0xFF16213E))),
+            text = Color(0xFFE8E6E0), sub = Color(0xFFA0A0B0),
+            btnText = Color(0xFFEDE9DF), dark = true,
+        )
+    }
 
-    // 启动页进场动画：背景淡入 + 整块内容轻微上浮（300ms）。只做一次、不经手指，保证零性能影响
+    // 进场动画：背景淡入 + 整块内容轻微上浮（300ms）。只做一次、不经手指。
     var entered by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { entered = true }
-    val alphaIn by animateFloatAsState(if (entered) 1f else 0f, tween(300), label = "splashFade")
-    val riseIn by animateFloatAsState(if (entered) 0f else 18f, tween(300, easing = LinearEasing), label = "splashRise")
+    // 7.4.1：走 token（跟着 debug 慢放）+ 减弱动效时瞬变（欢迎页是「叙事型」动画，最该被尊重）。
+    val alphaIn by animateFloatAsState(if (entered) 1f else 0f, motionSpec(Motion.enter(460)), label = "splashFade")
+    val riseIn by animateFloatAsState(
+        if (entered) 0f else 20f, motionSpec(Motion.glide(460)), label = "splashRise"
+    )
 
-    Box(Modifier.fillMaxSize().background(bg), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(40.dp).graphicsLayer {
-                alpha = alphaIn
-                translationY = riseIn
-            }) {
-            Text(greeting,
-                fontFamily = songtiFamily,
-                fontSize = 44.sp, fontWeight = FontWeight.Bold, color = textColor)
-            Spacer(Modifier.height(28.dp))
-            // 诗句：整句必须一行放下（最长 20 字，固定 18sp 要 360dp，而可用宽度只有约 280dp）
-            FitOneLine(poem.text, maxSize = 18.sp, minSize = 10.sp, color = textColor)
-            Spacer(Modifier.height(10.dp))
-            // 出处行同样整行不换行：最长的一条「—— 林黛玉《中秋夜大观园即景联句·与史湘云联句》」
-            // 有 22 字，固定 14sp 要 308dp，必折行
-            FitOneLine("—— ${poem.author}《${poem.title}》",
-                maxSize = 14.sp, minSize = 10.sp, color = subColor, lineHeightRatio = 1.5f)
-            Spacer(Modifier.height(60.dp))
-            Button(
-                onClick = onEnter,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isMorning) Accent else Color(0xFF4A6FA5)),
-                shape = RoundedCornerShape(28.dp),
-                modifier = Modifier.padding(horizontal = 40.dp)
+    val frameColor = palette.text.copy(alpha = if (palette.dark) 0.24f else 0.26f)
+    val cornerColor = palette.text.copy(alpha = if (palette.dark) 0.48f else 0.52f)
+
+    Box(Modifier.fillMaxSize()) {
+        // ① 背景层：一层竖向渐变。按钮不再采样它（见 GlassEnterButton 的注释），
+        //    留这层只为铺底色。
+        Box(Modifier.fillMaxSize().background(palette.bg))
+
+        // ② 问候：左上角小字
+        Text(
+            greeting,
+            fontFamily = songtiFamily, fontSize = 24.sp, fontWeight = FontWeight.Bold,
+            color = palette.text, letterSpacing = 3.sp,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .statusBarsPadding()
+                .padding(start = 30.dp, top = 22.dp)
+                .graphicsLayer { alpha = alphaIn }
+        )
+
+        // ②' 预览态：右上角标一行，避免把人唬住以为真的换了时段
+        if (previewKind != null) {
+            Text(
+                "预览 · 不写入设置",
+                fontFamily = songtiFamily, fontSize = 11.sp, color = palette.sub,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(end = 30.dp, top = 28.dp)
+                    .graphicsLayer { alpha = alphaIn }
+            )
+        }
+
+        // ③ 字框 + 按钮：当作一块整体，在屏内竖向居中
+        Box(
+            Modifier.fillMaxSize().padding(horizontal = 30.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .graphicsLayer { alpha = alphaIn; translationY = riseIn }
+                    // 直角细框 + 四角小角标。画在 padding 之外，所以框正好包住内容。
+                    .drawBehind {
+                        val sw = 1.dp.toPx()
+                        val inset = sw / 2f
+                        drawRect(
+                            color = frameColor,
+                            topLeft = Offset(inset, inset),
+                            size = Size(size.width - sw, size.height - sw),
+                            style = Stroke(sw)
+                        )
+                        val arm = 13.dp.toPx()
+                        val asw = 1.3.dp.toPx()
+                        fun corner(x: Float, y: Float, dx: Float, dy: Float) {
+                            drawLine(cornerColor, Offset(x, y), Offset(x + dx, y), asw)
+                            drawLine(cornerColor, Offset(x, y), Offset(x, y + dy), asw)
+                        }
+                        corner(0f, 0f, arm, arm)
+                        corner(size.width, 0f, -arm, arm)
+                        corner(0f, size.height, arm, -arm)
+                        corner(size.width, size.height, -arm, -arm)
+                    }
+                    .padding(start = 22.dp, end = 22.dp, top = 34.dp, bottom = 24.dp)
             ) {
-                Text("开启时序集", fontFamily = songtiFamily, fontSize = 17.sp,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp))
+                // 诗句与出处：整句必须一行放下（最长 20 / 22 字），字号自适应
+                FitOneLine(poem.text, maxSize = 18.sp, minSize = 10.sp, color = palette.text)
+                Spacer(Modifier.height(9.dp))
+                FitOneLine(
+                    "—— ${poem.author}《${poem.title}》",
+                    maxSize = 13.sp, minSize = 9.5.sp, color = palette.sub, lineHeightRatio = 1.5f
+                )
+                Spacer(Modifier.height(26.dp))
+                GlassEnterButton(
+                    label = if (previewKind != null) "返回设置" else "开启时序集",
+                    fg = palette.btnText,
+                    dark = palette.dark,
+                    onClick = onEnter
+                )
             }
         }
+    }
+}
+
+/**
+ * 「开启时序集」胶囊按钮。
+ *
+ * 2026-11-11 重做：这里**不再走 `liquidCapsule` 的 AGSL 折射**。
+ *
+ * 那个配方是给「背后有东西可折」的场景写的（整理页浮在列表上、底栏浮在内容上）；
+ * 欢迎页背后只是一层均匀的竖向渐变，模糊与折射都采不到任何信息 —— 一圈折射带只会在
+ * 均匀底色上糊出一块脏白，白 0.20 又把薄荷底洗成灰白，再加一道黑投影，看着像塑料药片。
+ *
+ * 现在照设计稿（HTML 预览里那一版）逐条搬过来，全部用普通绘制完成：
+ *   体色  白 0.20（深色 0.13）                —— `background`
+ *   高光  左上 30% / 12% 处的柔光团，白 0.55  —— `Brush.radialGradient`
+ *   描边  1dp 白 0.35                          —— `border`
+ *   投影  0/6/14/-4 黑 0.16 ＋ 0/2/4 黑 0.10   —— 两层 `shadow`
+ * 均匀底上玻璃本来就靠这四样成像，不需要真的采样背景（那份背景本身也没有细节可采）。
+ */
+@Composable
+private fun GlassEnterButton(
+    label: String,
+    fg: Color,
+    dark: Boolean,
+    onClick: () -> Unit,
+) {
+    val shape = remember { RoundedCornerShape(SPLASH_BTN_H / 2) }
+    val press = remember { MutableInteractionSource() }
+    val haptics = LocalHapticFeedback.current
+    // 深色底上白 0.13 会灰成一块「塑料板」——真玻璃在暗底上只是**微微发亮**，
+    // 靠的是那道亮边，所以体色压到 0.08、描边提到 0.38。
+    val bodyAlpha = if (dark) 0.08f else 0.20f
+    val haloAlpha = if (dark) 0.20f else 0.55f
+
+    val shadowMain = if (dark) 0.30f else 0.13f
+    val shadowTight = if (dark) 0.18f else 0.075f
+    Box(
+        Modifier
+            .height(SPLASH_BTN_H)
+            // 投影必须只画在胶囊**外面**：`Modifier.shadow` 是画在整个节点后面的，
+            // 而这颗胶囊体色只有白 0.20 —— 投影会从半透明体里透出来，把整块压灰
+            // （实测比设计稿暗 8~10 个色阶，下半部分更明显）。
+            .dropShadow(SPLASH_BTN_H / 2, dy = 7.dp, blur = 14.dp, spread = (-5).dp,
+                color = Color.Black.copy(alpha = shadowMain))
+            .dropShadow(SPLASH_BTN_H / 2, dy = 2.dp, blur = 4.dp, spread = 0.dp,
+                color = Color.Black.copy(alpha = shadowTight))
+            .clip(shape)
+            // ① 体色：一层半透明白，透出身后渐变
+            .background(Color.White.copy(alpha = bodyAlpha))
+            // ② 高光团：CSS 里的 radial-gradient(120% 90% at 30% 12%)
+            .drawWithContent {
+                drawContent()
+                // 高光是**椭圆**：设计稿是 radial-gradient(120% 90% at 30% 12%)，
+                // 竖向只铺到 90% 高度、并在 60% 处衰减为 0。
+                //
+                // 这里踩过一个大坑：早先用 `scale(1f, k, pivot = 光心)` 再 `drawRect(brush)`
+                // 整块画布一起被压扁 —— 画满整个画布的矩形被压成**一条横带**
+                // （实测 y=29..63 亮、之外没有），上沿出现一道硬邦邦的亮条，看着就是割裂。
+                // 正确做法是绕原点压扁，并把矩形按 1/k 拉高，才覆盖得住整块画布。
+                val c = Offset(size.width * 0.30f, size.height * 0.12f)
+                val rx = size.width * if (dark) 0.54f else 0.72f      // 1.2×w×0.6
+                val ry = size.height * if (dark) 0.54f else 0.54f     // 0.9×h×0.6
+                val k = ry / rx
+                val brush = Brush.radialGradient(
+                    colors = listOf(Color.White.copy(alpha = haloAlpha), Color.Transparent),
+                    center = Offset(c.x, c.y / k),
+                    radius = rx
+                )
+                withTransform({ scale(1f, k, pivot = Offset.Zero) }) {
+                    drawRect(brush, topLeft = Offset.Zero, size = Size(size.width, size.height / k))
+                }
+            }
+            // ③ 描边：1dp 白 0.35（画在内侧，与 CSS 的 border 同口径）
+            .border(1.dp, Color.White.copy(alpha = if (dark) 0.38f else 0.35f), shape)
+            .clickable(interactionSource = press, indication = null, role = Role.Button) {
+                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                onClick()
+            }
+            .pressScale(press, pressed = Motion.PRESS_BUTTON),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            label,
+            fontFamily = songtiFamily, fontSize = 15.5.sp, color = fg, letterSpacing = 1.5.sp,
+            modifier = Modifier.padding(horizontal = 30.dp)
+        )
+    }
+}
+
+/**
+ * 只画在形状**外侧**的柔和投影。
+ *
+ * 为什么不用 `Modifier.shadow`：它把投影画在整个节点后面，胶囊体色只有白 0.20，
+ * 投影会透上来把胶囊压灰 —— 实测比设计稿暗 8~10 个色阶，而且下半部分比上半部分更脏。
+ * 这里改成「一圈圈向外扩的环」：每层都用 `Path.op(Difference)` 挖掉胶囊本身，
+ * 所以内部一个像素都不会被染；alpha 按 (1-t)² 递减，叠起来接近高斯尾巴。
+ */
+private fun Modifier.dropShadow(
+    radius: Dp,
+    dy: Dp,
+    blur: Dp,
+    spread: Dp,
+    color: Color,
+): Modifier = drawBehind {
+    val r = radius.toPx()
+    val dyPx = dy.toPx()
+    val blurPx = blur.toPx()
+    val spreadPx = spread.toPx()
+    if (blurPx <= 0f) return@drawBehind
+    val inner = Path().apply {
+        addRoundRect(RoundRect(0f, 0f, size.width, size.height, CornerRadius(r)))
+    }
+    val steps = 12
+    // 重叠层的 alpha 会累加：Σ ≈ color.alpha × (1 − d/blur)³，所以单层取 3α/n·(1−t)²。
+    val unit = 3f * color.alpha / steps
+    for (i in steps downTo 1) {
+        val t = i / steps.toFloat()
+        val grow = spreadPx + blurPx * t
+        val a = unit * (1f - t) * (1f - t)
+        if (a <= 0.002f) continue
+        val ring = Path().apply {
+            addRoundRect(
+                RoundRect(
+                    -grow, dyPx - grow, size.width + grow, size.height + dyPx + grow,
+                    CornerRadius(r + grow)
+                )
+            )
+        }
+        ring.op(ring, inner, PathOperation.Difference)
+        drawPath(ring, color.copy(alpha = a))
     }
 }

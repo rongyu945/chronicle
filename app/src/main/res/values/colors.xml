@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 主题背景色（浅色 BgLight），作窗口底色消除冷启动白闪 -->
-    <color name="shixuji_bg">#F2F2F7</color>
+    <!-- 窗口底色 = 浅色主题的宣纸底 BgLight（#F7F1E6）。
+         2026-11-08 审计 I 项：原来写的是 #F2F2F7（偏冷的蓝灰），冷启动那一下和进入 App 后的
+         暖纸底是**两种颜色**，观感像先闪了一个别的 App。这里必须和 Theme.kt 的 BgLight 同值。 -->
+    <color name="shixuji_bg">#F7F1E6</color>
+    <!-- 长按图标快捷方式里的图标颜色。快捷方式图标由桌面（Launcher）绘制、不吃 App 主题，
+         所以必须自己按明暗提供两套：浅色=墨色，深色=米白（见 values-night）。 -->
+    <color name="shortcut_icon">#FF392F41</color>
 </resources>

@@ -1,0 +1,28 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 快捷方式「记一条待办」：方框打勾。
+         做法：图标自带品牌红底圆 + 白色图形（整体缩到 0.62 居中），不依赖明暗主题。
+         原因：快捷方式图标由桌面绘制，各家 Launcher 给它的底衬不一致（Pixel 系会垫一个白圆），
+         跟着主题变色的图形在白圆上反而会消失 —— 自带底色最稳，深浅模式都看得见。 -->
+    <path
+        android:fillColor="#FFED5736"
+        android:pathData="M12,1.2 a10.8,10.8 0 1 1 0,21.6 a10.8,10.8 0 1 1 0,-21.6 z" />
+    <group android:scaleX="0.62" android:scaleY="0.62" android:pivotX="12" android:pivotY="12">
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+            android:pathData="M8.5,3.5 h7 a5,5 0 0 1 5,5 v7 a5,5 0 0 1 -5,5 h-7 a5,5 0 0 1 -5,-5 v-7 a5,5 0 0 1 5,-5 z" />        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+            android:pathData="M8.2,12.3 l2.6,2.6 l5,-5.4" />
+    </group>
+</vector>

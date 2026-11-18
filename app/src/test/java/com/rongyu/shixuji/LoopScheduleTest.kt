@@ -101,4 +101,90 @@ class LoopScheduleTest {
         assertEquals("今天就是提醒日 → 显示今天", day(2026, 11, 5), LoopSchedule.upcomingDate(l, day(2026, 11, 5)))
         assertEquals(day(2026, 11, 9), LoopSchedule.upcomingDate(l, day(2026, 11, 6)))
     }
+
+    // ===== 日序号口径（2026-11-08 审计 A 项）==================================
+
+    @Test
+    fun 日序号是公历日序号不随系统时区漂移() {
+        // 2026-11-08 在任何时区都必须是同一个数（1970-01-01 = 0）
+        assertEquals(20765L, LoopSchedule.daysFromCivil(2026, 11, 8))
+        assertEquals(0L, LoopSchedule.daysFromCivil(1970, 1, 1))
+        // 闰日不能少算：2024-02-29 紧跟 2024-02-28
+        assertEquals(
+            LoopSchedule.daysFromCivil(2024, 2, 28) + 1,
+            LoopSchedule.daysFromCivil(2024, 2, 29)
+        )
+        assertEquals(
+            LoopSchedule.daysFromCivil(2024, 2, 29) + 1,
+            LoopSchedule.daysFromCivil(2024, 3, 1)
+        )
+        // 世纪闰年规则：1900 不是闰年，2000 是
+        assertEquals(365L, LoopSchedule.daysFromCivil(1901, 1, 1) - LoopSchedule.daysFromCivil(1900, 1, 1))
+        assertEquals(366L, LoopSchedule.daysFromCivil(2001, 1, 1) - LoopSchedule.daysFromCivil(2000, 1, 1))
+        // 与 Calendar 无关：同一天的不同时刻，日序号相同
+        assertEquals(LoopSchedule.dayNumber(day(2026, 11, 8)), LoopSchedule.dayNumber(day(2026, 11, 8) + 23 * 3600_000L))
+    }
+
+    @Test
+    fun 旧格式doneDates整体平移后仍能对上勾选() {
+        // 老库里 11-08 记的是旧口径（东八区 = 新口径 − 1）
+        val shifted = LoopSchedule.shiftDoneDates("20764,20760", 1)
+        assertEquals("20765,20761", shifted)
+        val l = loop(day(2026, 11, 1), day(2026, 11, 5)).copy(doneDates = shifted)
+        assertTrue("平移后 11-08 应该是已勾", LoopSchedule.isDoneOn(l, day(2026, 11, 8)))
+        assertTrue("平移后 11-04 也是已勾（20761 = 11-04）", LoopSchedule.isDoneOn(l, day(2026, 11, 4)))
+        assertFalse("没记过的 11-03 不该是已勾", LoopSchedule.isDoneOn(l, day(2026, 11, 3)))
+        // delta = 0（西半球）时原样返回；空串不炸
+        assertEquals("20764", LoopSchedule.shiftDoneDates("20764", 0))
+        assertEquals("", LoopSchedule.shiftDoneDates("", 1))
+        // 脏数据里的非数字项丢掉，不把整串写坏
+        assertEquals("20765,20761", LoopSchedule.shiftDoneDates("20764,,abc,20760", 1))
+    }
+
+    // ===== 7.5.2（审查 5.3 / 5.4）=====
+
+    @Test fun `间隔超过上限时夹到 MAX_INTERVAL_DAYS`() {
+        val start = LoopSchedule.dayStart(1_800_000_000_000L)
+        val far = start + 5000L * 86_400_000L
+        assertEquals(LoopSchedule.MAX_INTERVAL_DAYS, LoopSchedule.intervalOf(start, far))
+        // 上限以内原样返回
+        assertEquals(3650, LoopSchedule.intervalOf(start, start + 3650L * 86_400_000L))
+        assertEquals(1, LoopSchedule.intervalOf(start, start))
+    }
+
+    @Test fun `日序号上下界与毫秒时间戳的区分`() {
+        assertTrue(LoopSchedule.isDayNumber(0))
+        assertTrue(LoopSchedule.isDayNumber(LoopSchedule.MAX_DAY_NUMBER))   // 约 4708 年，上限本身合法
+        assertFalse(LoopSchedule.isDayNumber(1_700_000L))                  // 超上限（约 6384 年）
+        assertFalse(LoopSchedule.isDayNumber(-1))
+        assertFalse(LoopSchedule.isDayNumber(1_700_000_000_000L))  // 毫秒时间戳，不是日序号
+        assertFalse(LoopSchedule.isDayNumber(LoopSchedule.MAX_DAY_NUMBER + 1))
+    }
+
+    @Test fun `迁移平移到毫秒时间戳时原样保留`() {
+        val raw = "19000,1700000000000"
+        val shifted = LoopSchedule.shiftDoneDates(raw, 1)
+        assertTrue(shifted.contains("1700000000000"))
+        assertTrue(shifted.contains("19001"))
+    }
+
+    /**
+     * 7.5.5（复核报告 3.9）：编辑已有条目时，**间隔以库里那份为准**，不能按两个日期反推。
+     *
+     * 实测事故：吃维生素 intervalDays=1，startDate 10月30日、nextDate 被自动推到了 11月11日；
+     * 打开弹窗什么也没改、点保存，间隔就变成 12 天，提醒序列跟着改。
+     */
+    @Test fun `编辑时保留库里的间隔_不按日期反推`() {
+        val start = day(2026, 10, 30)
+        val next = day(2026, 11, 11)
+        // 库里是 1 天：哪怕两个日期差 12 天，也必须是 1
+        assertEquals(1, LoopSchedule.intervalForEdit(1, start, next))
+        assertEquals(4, LoopSchedule.intervalForEdit(4, start, next))
+        // 新建（库里没有）：才由两个日期推
+        assertEquals(12, LoopSchedule.intervalForEdit(null, start, next))
+        // 库里是坏值（0 / 负数 / 超过上限）一律夹到合法范围，不让它把序列算飞
+        assertEquals(1, LoopSchedule.intervalForEdit(0, start, next))
+        assertEquals(1, LoopSchedule.intervalForEdit(-3, start, next))
+        assertEquals(LoopSchedule.MAX_INTERVAL_DAYS, LoopSchedule.intervalForEdit(99_999, start, next))
+    }
 }

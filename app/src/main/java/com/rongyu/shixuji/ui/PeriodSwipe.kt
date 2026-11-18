@@ -38,6 +38,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import com.rongyu.shixuji.ui.motion.Motion
 
 // 程序化翻页的三种走法
 private const val MODE_NONE = 0
@@ -186,7 +187,7 @@ fun PeriodSwipe(
                 // 程序化翻页**不用弹簧**：弹簧在 t=0 就把速度顶到最大值（位移从 0 起跳到 1080px，
                 // 初速度 = 1080·ω），视觉上是"啪地一弹 + 后面爬一段小尾巴"，正是用户说的不自然。
                 // 用带缓入缓出的 tween：从静止加速、中段最快、末端平滑落位，像翻页。
-                val pageTurn = tween<Float>(330, easing = FastOutSlowInEasing)
+                val pageTurn = tween<Float>(375, easing = Motion.Glide)
                 when (reqMode) {
                     MODE_STEP -> {
                         // 相邻那一页画的就是目标内容：滑到位，然后在**动画结束那一帧**提交。
@@ -213,8 +214,8 @@ fun PeriodSwipe(
                     MODE_JUMP -> {
                         // 滑一小段 + 淡出（此刻画面里还是旧内容）→ 悄悄换 → 从另一侧滑回来。
                         // 位移只用 28dp：它表达的是"方向"，不是在假装滑了一页。
-                        val shift = with(density) { 28.dp.toPx() }
-                        animate(0f, 1f, animationSpec = tween(150, easing = FastOutLinearInEasing)) { t, _ ->
+                        val shift = with(density) { 22.dp.toPx() }
+                        animate(0f, 1f, animationSpec = tween(170, easing = Motion.PaperExit)) { t, _ ->
                             offset = -reqDir * shift * t
                             layerAlpha = 1f - t
                         }
@@ -222,7 +223,7 @@ fun PeriodSwipe(
                         layerAlpha = 0f
                         reqSwap?.invoke()
                         withFrameNanos { }   // 让换好的内容先落一帧（此刻 alpha = 0，看不见）
-                        animate(0f, 1f, animationSpec = tween(220, easing = LinearOutSlowInEasing)) { t, _ ->
+                        animate(0f, 1f, animationSpec = tween(255, easing = Motion.PaperEnter)) { t, _ ->
                             offset = reqDir * shift * (1f - t)
                             layerAlpha = t
                         }
@@ -245,8 +246,11 @@ fun PeriodSwipe(
                 .draggable(
                     state = dragState,
                     orientation = Orientation.Horizontal,
-                    enabled = enabled,
+                    // ★ 落位动画期间关掉手势：旧版只在 dragState 里挡 delta，draggable 本身没关，
+                    //   「甩 + 甩」会再起一条动画、各自 onCommit → 一次跳两页，两条 animate 还抢同一个 offset。
+                    enabled = enabled && !busy,
                     onDragStopped = { velocity ->
+                        if (busy) return@draggable
                         val settled = offset
                         val forward = settled < 0
                         val pass = abs(settled) > widthPx * 0.25f || abs(velocity) > 800f

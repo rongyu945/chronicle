@@ -18,10 +18,14 @@ android {
 
     defaultConfig {
         applicationId "com.rongyu.shixuji"
-        minSdk 24
+        // 2026-11-06 用户裁决：彻底放弃 Android 11 及以下。
+        // 硬理由：玻璃的模糊走 RenderEffect，API 31 以下系统会**直接忽略**这个属性，
+        // 整块玻璃退化成一枚半透明白板——背景既没糊、边也没化。靠压暗/加白糊过去
+        // 已经不是这套设计了，所以宁可不支持旧机。
+        minSdk 31
         targetSdk 34
-        versionCode 537
-        versionName "5.5.1"
+        versionCode 863
+        versionName "8.6.3"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -42,8 +46,9 @@ android {
         }
     }
     compileOptions {
-        // 统一周条组件（ui/motion）用 java.time.LocalDate 做日期几何：
-        // minSdk 24 < 26，java.time 在 Android 8.0 以下不存在，必须开脱糖。
+        // 统一周条组件（ui/motion）用 java.time.LocalDate 做日期几何。
+        // 脱糖已经不必需（minSdk 31 起 java.time 原生可用），但去掉要重新验一遍所有库，
+        // 收益为零、风险非零，所以留着。
         // 顺带附带 DST 正确性：按「日历天数」而不是「毫秒差 ÷ 86400000」算天数差。
         coreLibraryDesugaringEnabled true
         sourceCompatibility JavaVersion.VERSION_17
